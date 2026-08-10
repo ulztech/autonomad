@@ -1,8 +1,7 @@
 {
-  "updated_at": "2026-08-11T02:34:01.8967926+08:00",
-  "current_step": "github_sync",
+  "updated_at": "2026-08-11T02:35:03.2707278+08:00",
+  "current_step": "human_approval",
   "pending": [
-    "github_sync",
     "human_approval"
   ],
   "pipeline_id": "pautonomad-v1",
@@ -15,7 +14,8 @@
     "security_gate",
     "verifier_gate",
     "commit_push",
-    "artifact_report"
+    "artifact_report",
+    "github_sync"
   ],
   "issue_ref": "autonomad#1-#9",
   "project": "autonomad",
@@ -27,12 +27,12 @@
     "review_gate": "completed",
     "verifier_gate": "completed",
     "implementation": "completed",
-    "github_sync": "in_progress",
-    "human_approval": "pending",
+    "github_sync": "completed",
+    "human_approval": "in_progress",
     "artifact_report": "completed"
   },
   "created_at": "2026-08-11T01:22:32.1370173+08:00",
   "owner": "orchestrator",
-  "next_gate": "human_approval",
+  "next_gate": null,
   "repo": "ulztech/autonomad"
 }
