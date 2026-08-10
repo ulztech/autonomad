@@ -1,0 +1,61 @@
+{
+  "issue_number": 1,
+  "pr_url": "https://github.com/ulztech/autonomad/pull/10",
+  "confidence": 1.0,
+  "max_retries": 2,
+  "updated_at": "2026-08-10T17:57:31.6395391Z",
+  "project": "autonomad",
+  "pipeline_id": "autonomad-issue-1",
+  "halt_reason": null,
+  "timestamps": {
+    "branch_guard": "2026-08-10T17:57:31.6396345Z",
+    "github_sync": "2026-08-10T17:57:31.6396587Z"
+  },
+  "issue": {
+    "labels": [
+      "pending-review"
+    ],
+    "body": "Scaffold the autonomad repository so the rest of the pipeline has a home.",
+    "url": "https://github.com/ulztech/autonomad/issues/1",
+    "title": "[T1] Scaffold autonomad repo, config contract, Dockerfile"
+  },
+  "model": "deepseek/deepseek-v4-flash",
+  "status": "pending-review",
+  "last_error": null,
+  "harness": "opencode",
+  "branch": "autonomad/issue-1",
+  "issue_ref": "issue-1",
+  "owner": "autonomad-bot",
+  "next_gate": null,
+  "created_at": "2026-08-10T17:57:31.6330317Z",
+  "current_step": "github_sync",
+  "gates": {
+    "security_gate": "completed",
+    "artifact_report": "completed",
+    "commit_push": "completed",
+    "review_gate": "completed",
+    "github_sync": "completed",
+    "implementation": "completed",
+    "human_approval": "pending",
+    "tester_gate": "completed",
+    "verifier_gate": "completed",
+    "branch_guard": "completed"
+  },
+  "completed": [
+    "branch_guard",
+    "implementation",
+    "tester_gate",
+    "review_gate",
+    "security_gate",
+    "verifier_gate",
+    "commit_push",
+    "artifact_report",
+    "github_sync"
+  ],
+  "pending": [
+    "human_approval"
+  ],
+  "attempts": 0,
+  "schema_version": 1,
+  "repo": "ulztech/autonomad"
+}
