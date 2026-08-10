@@ -1,0 +1,5 @@
+# Autonomad v1 — reports/
+#
+# Per-issue HTML artifact reports (reports/{issue-ref}.html) and the run log
+# (reports/runs.log) are generated at runtime and git-ignored. This file keeps
+# the scaffold directory tracked.

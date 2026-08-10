@@ -1,0 +1,34 @@
+# Autonomad v1 — .gitignore
+
+# Secrets — never commit
+.env
+*.env.local
+
+# Runtime data
+learning.db
+learning.db-*
+*.db
+*.db-shm
+*.db-wal
+last_tick.ts
+
+# Generated artifacts
+reports/*.html
+reports/runs.log
+logs/
+runs.log
+data-handoff/
+workspaces/
+learning.jsonl
+
+# Node / harness caches
+node_modules/
+.opencode/
+.cache/
+
+# OS noise
+.DS_Store
+Thumbs.db
+
+# Scratch
+.scratch/
