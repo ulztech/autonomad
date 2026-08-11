@@ -68,6 +68,11 @@ autonomad/
 - Halt = `needs-human` + comment (confidence <90%, plan escalation/fatal flaw,
   N=2 failed attempts, or missing pipeline-state).
 
+## Scripts
+
+- `pwsh -File scripts/Check-LegacyApp.ps1 [-SolutionRoot <dir>]` — structural health
+  check for a legacy HRIS solution (PASS/WARN/FAIL table, exit 0 = all PASS, 1 = any FAIL).
+
 ## Testing
 
 - `pwsh -File scripts/DryRun-Autonomad.ps1` runs the full claim → develop → close-out →
