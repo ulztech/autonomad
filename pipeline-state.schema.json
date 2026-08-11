@@ -68,6 +68,14 @@
       "type": ["string", "null"],
       "description": "Model override from repo.config; null/empty means harness default."
     },
+    "parent_ref": {
+      "type": ["integer", "null"],
+      "description": "Issue number of the revision parent (parsed from `Parent: #N` in the issue body). Null for a root ticket."
+    },
+    "root_ref": {
+      "type": ["integer", "null"],
+      "description": "Issue number of the root ticket in the revision chain. Equals issue_number for a root; points at the ancestor for a child (revision)."
+    },
     "current_step": {
       "type": "string",
       "enum": [

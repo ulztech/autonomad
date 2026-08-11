@@ -13,15 +13,17 @@
 #   halt      — low confidence -> needs-human, comment, NO PR
 #   fail      — 2 failed attempts -> needs-human hard stop, NO PR
 #   missing   — dev agent writes nothing -> fails closed -> needs-human
+#   revision  — parent+child pair: child claims, reuses the root's open PR,
+#               force-pushes, appends a PR comment; publish-learnings writes the dated file.
 #
 # Asserts the autonomy boundary: no merge events, no `approved` label applied by
 # the bot in ANY scenario.
 #
-# Usage:  pwsh -File scripts/DryRun-Autonomad.ps1 [-Scenario success|halt|fail|missing|all]
+# Usage:  pwsh -File scripts/DryRun-Autonomad.ps1 [-Scenario success|halt|fail|missing|revision|all]
 
 [CmdletBinding()]
 param(
-    [ValidateSet('success', 'halt', 'fail', 'missing', 'all')]
+    [ValidateSet('success', 'halt', 'fail', 'missing', 'revision', 'all')]
     [string]$Scenario = 'all'
 )
 
@@ -83,6 +85,51 @@ function New-MockState([string]$Dir, [int]$IssueNumber = 1, [string]$Title = 'Dr
     return $stateFile
 }
 
+<#
+.SYNOPSIS
+  Mock state for the revision scenario: a root ticket (#1, already pending-review
+  with an OPEN PR on autonomad/issue-1) and a child revision ticket (#2) whose body
+  carries `Parent: #1` + a `revision:` feedback line. next_pr starts at 2 so a
+  reused root PR (PR #1) is distinguishable from a fresh PR (which would be #2).
+#>
+function New-MockStateRevision([string]$Dir) {
+    $state = @{
+        labels = @{}
+        issues = @{
+            '1' = @{
+                number = 1
+                title = 'Root issue (parent)'
+                body = "Root ticket. No parent marker — this IS the root.`n`nOriginal request: add a report."
+                url = "https://github.com/throwaway/autonomad/issues/1"
+                state = 'OPEN'
+                labels = @('pending-review')
+                assignees = @('autonomad-bot')
+            }
+            '2' = @{
+                number = 2
+                title = 'Revision: change report colors'
+                body = "Parent: #1`n`nrevision: change the report header color to blue and widen the table.`n`nRequested changes on top of PR #1."
+                url = "https://github.com/throwaway/autonomad/issues/2"
+                state = 'OPEN'
+                labels = @('autonomous')
+                assignees = @()
+            }
+        }
+        next_pr = 2
+        prs = @{
+            pr1 = @{
+                number = 1
+                head = 'autonomad/issue-1'
+                state = 'OPEN'
+                url = 'https://github.com/throwaway/autonomad/pull/1'
+            }
+        }
+    }
+    $stateFile = Join-Path $Dir 'mock-state.json'
+    $state | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $stateFile -Encoding utf8
+    return $stateFile
+}
+
 function New-RepoConfig([string]$Dir) {
     $cfg = @"
 repo = throwaway/autonomad
@@ -97,6 +144,7 @@ ttl = 3600
 max_retries = 2
 bot_login = autonomad-bot
 branch_prefix = autonomad
+learnings_dir = $Dir/data/learnings
 brain_paths = graphify-out,context,references,decisions,.github/skills,.github/agents
 "@
     Set-Content -LiteralPath (Join-Path $Dir 'repo.config') -Value $cfg -Encoding utf8
@@ -149,6 +197,28 @@ function Get-Events([string]$Dir) {
 
 function Get-IssueState([string]$StateFile) {
     return Get-Content -LiteralPath $StateFile -Raw | ConvertFrom-Json
+}
+
+<#
+.SYNOPSIS
+  Read rows from the dry-run learning.db using the same backend the dry-run forced
+  (sqlite3cli | python). Returns each row as a string (columns joined) for simple
+  regex assertions.
+#>
+function Get-DbRows([string]$Db, [string]$Backend, [string]$Sql) {
+    if ($Backend -eq 'python') {
+        $py = (Get-Command python -ErrorAction Stop).Source
+        $env:LEARN_DB = $Db
+        # Pipe SQL via stdin to avoid quoting issues; rows joined with \u0001.
+        $rows = $Sql | & $py -c "import sqlite3, os, sys; con=sqlite3.connect(os.environ['LEARN_DB']); cur=con.cursor(); cur.execute(sys.stdin.read()); print(chr(1).join([str(r) for r in cur.fetchall()]))"
+        if ($LASTEXITCODE -ne 0) { throw "python db read failed: $Sql" }
+        if ([string]::IsNullOrWhiteSpace(($rows -join ''))) { return ,@() }
+        return ,@($rows -split "`u{1}")
+    }
+    $cli = (Get-Command sqlite3 -ErrorAction Stop).Source
+    $rows = & $cli $Db $Sql
+    if ($LASTEXITCODE -ne 0) { throw "sqlite3 db read failed: $Sql" }
+    return @($rows)
 }
 
 function Assert($Condition, [string]$Message) {
@@ -218,6 +288,10 @@ function Test-Scenario([string]$ScenarioName, [string]$Outcome, [string[]]$Setup
             # branch pushed to the throwaway remote
             $branches = git --git-dir="$($git.Bare)" for-each-ref --format='%(refname)' 2>&1
             Assert (($branches -join "`n") -match 'autonomad/issue-1') "branch autonomad/issue-1 pushed to remote"
+            $comments = @($events | Where-Object { $_.type -eq 'issue_comment' })
+            $allComments = (($comments | ForEach-Object { $_.body }) -join "`n")
+            Assert ($allComments -match '## Tracking') "claim posted a Tracking block"
+            Assert ($allComments -match 'tracking_ref.*#1') "Tracking block carries tracking_ref #1"
         }
         'halt' {
             $prs = @($events | Where-Object { $_.type -eq 'pr_create' })
@@ -225,25 +299,141 @@ function Test-Scenario([string]$ScenarioName, [string]$Outcome, [string[]]$Setup
             Assert ($iss1.labels -contains 'needs-human') "issue labeled needs-human"
             Assert ($iss1.labels -notcontains 'pending-review') "not labeled pending-review"
             $comments = @($events | Where-Object { $_.type -eq 'issue_comment' })
-            Assert ($comments.Count -ge 1) "halt comment left on issue"
-            Assert (($comments[0].body -join '') -match 'needs a human') "comment explains needs-human reason"
+            Assert ($comments.Count -ge 2) "halt comment left on issue (claim tracking + halt; got $($comments.Count))"
+            $allComments = (($comments | ForEach-Object { $_.body }) -join "`n")
+            Assert ($allComments -match 'needs a human') "comment explains needs-human reason"
+            Assert ($allComments -match '## Tracking') "claim posted a Tracking block"
         }
         'fail' {
             $prs = @($events | Where-Object { $_.type -eq 'pr_create' })
             Assert ($prs.Count -eq 0) "NO PR created after 2 failed attempts"
             Assert ($iss1.labels -contains 'needs-human') "hard stop labeled needs-human"
             $comments = @($events | Where-Object { $_.type -eq 'issue_comment' })
-            Assert (($comments | Measure-Object).Count -ge 1) "halt comment left after hard stop"
+            $allComments = (($comments | ForEach-Object { $_.body }) -join "`n")
+            Assert (($comments | Measure-Object).Count -ge 2) "halt comment left after hard stop"
+            Assert ($allComments -match 'needs a human') "comment explains needs-human reason"
         }
         'missing' {
             $prs = @($events | Where-Object { $_.type -eq 'pr_create' })
             Assert ($prs.Count -eq 0) "NO PR created when state missing (fails closed)"
             Assert ($iss1.labels -contains 'needs-human') "fails-closed labeled needs-human"
             $comments = @($events | Where-Object { $_.type -eq 'issue_comment' })
-            Assert (($comments | Measure-Object).Count -ge 1) "fails-closed comment left"
+            $allComments = (($comments | ForEach-Object { $_.body }) -join "`n")
+            Assert (($comments | Measure-Object).Count -ge 2) "fails-closed comment left"
+            Assert ($allComments -match 'needs a human') "comment explains needs-human reason"
         }
     }
     Write-Host "SCENARIO $ScenarioName PASSED"
+}
+
+<#
+.SYNOPSIS
+  Revision-loop scenario (Phase 0-4 E2E): a root ticket (#1) already has an OPEN
+  PR (PR #1 on autonomad/issue-1). A child revision ticket (#2, `Parent: #1` +
+  `revision:` feedback) is claimed; it must:
+    - resolve the root (#1) and reuse its branch autonomad/issue-1,
+    - NOT open a new PR (reuses PR #1, no pr_create event),
+    - force-push the reused branch and append a revision PR comment,
+    - record a revision lesson + bump revision_count on the root in learning.db,
+    - publish learnings to a dated file.
+#>
+function Test-RevisionScenario {
+    Write-Host ""
+    Write-Host "======================================================"
+    Write-Host "SCENARIO: revision (parent+child, PR reuse)"
+    Write-Host "======================================================"
+    $dir = New-ScenarioDir 'revision'
+    New-RepoConfig $dir
+    $git = New-BareRepo $dir
+    $stateFile = New-MockStateRevision $dir
+    # The CHILD workspace is issue-2; its branch is the ROOT's autonomad/issue-1.
+    $dataDir = Join-Path $dir 'data'
+    $wsTarget = Join-Path $dataDir 'workspaces' 'issue-2'
+    New-Item -ItemType Directory -Path (Split-Path -Parent $wsTarget) -Force | Out-Null
+    Copy-Item -Recurse -LiteralPath $git.Workspace -Destination $wsTarget
+    Push-Location $wsTarget
+    try {
+        git remote set-url origin $git.Bare
+        git checkout main 2>$null | Out-Null
+        # Seed the ROOT branch locally + on the remote so the child can check it out
+        # and force-with-lease push onto it (mock of the root's already-open PR).
+        git checkout -b autonomad/issue-1 2>&1 | Out-Null
+        if ($LASTEXITCODE -ne 0) { throw "git checkout -b autonomad/issue-1 failed" }
+        git -c user.name='seed' -c user.email='seed@example.com' commit --allow-empty -m 'root work (seeded)' 2>&1 | Out-Null
+        git push -u origin autonomad/issue-1 2>&1 | Out-Null
+        if ($LASTEXITCODE -ne 0) { throw "git push -u origin autonomad/issue-1 failed" }
+        git checkout main 2>$null | Out-Null
+    } finally { Pop-Location }
+
+    Set-ScenarioEnv $dir $stateFile 'success'
+
+    $r1 = Invoke-TickOnce $dir $dataDir
+    Write-Host "--- tick run output (revision) ---"
+    Write-Host $r1.Output
+
+    $events = Get-Events $dir
+    $issue = Get-IssueState $stateFile
+    $iss2 = $issue.issues.'2'
+    $iss1 = $issue.issues.'1'
+
+    # --- autonomy boundary (universal) ---
+    $mergeEvents = @($events | Where-Object { $_.type -eq 'merge' })
+    Assert ($mergeEvents.Count -eq 0) "no merge events in revision scenario"
+    Assert ($iss2.labels -notcontains 'approved') "bot never applies 'approved' label"
+
+    # --- no NEW PR; the root's PR is reused ---
+    $prCreates = @($events | Where-Object { $_.type -eq 'pr_create' })
+    Assert ($prCreates.Count -eq 0) "NO new PR created (child reuses root PR #1)"
+    Assert ($issue.next_pr -eq 2) "mock PR counter untouched (no PR #2 created)"
+    $prComments = @($events | Where-Object { $_.type -eq 'pr_comment' })
+    Assert ($prComments.Count -eq 1) "revision note appended to reused PR"
+    $prCommentBodies = (($prComments | ForEach-Object { $_.body }) -join "`n")
+    Assert ($prCommentBodies -match 'revision') "PR comment mentions revision"
+    Assert ($prComments[0].pr -eq 1) "revision comment landed on PR #1"
+
+    # --- child close-out state ---
+    Assert ($iss2.labels -contains 'pending-review') "child issue #2 labeled pending-review"
+    Assert ($iss2.labels -notcontains 'autonomous') "child removed from autonomous pool"
+    # root keeps its claim (stays pending-review + assigned)
+    Assert ($iss1.labels -contains 'pending-review') "root issue #1 still pending-review"
+    Assert ($iss1.assignees -contains 'autonomad-bot') "root still assigned to bot"
+
+    # --- branch force-pushed to the throwaway remote ---
+    $branches = git --git-dir="$($git.Bare)" for-each-ref --format='%(refname)' 2>&1
+    Assert (($branches -join "`n") -match 'autonomad/issue-1') "root branch autonomad/issue-1 still present on remote"
+
+    # --- learning.db: revision lesson + root revision_count ---
+    Assert (Test-Path -LiteralPath (Join-Path $dataDir 'learning.db')) "learning.db created (SQLite)"
+    $db = Join-Path $dataDir 'learning.db'
+    $backend = [System.Environment]::GetEnvironmentVariable('AUTONOMAD_LEARN_BACKEND')
+    $revRows = Get-DbRows $db $backend "SELECT child_ref, root_ref, request FROM revisions;"
+    Assert ($revRows.Count -eq 1) "exactly one revision lesson recorded (got $($revRows.Count))"
+    Assert (($revRows[0] -join ' ') -match 'issue-2') "revision lesson references child issue-2"
+    Assert (($revRows[0] -join ' ') -match 'issue-1') "revision lesson references root issue-1"
+    $rootRow = Get-DbRows $db $backend "SELECT issue_ref, revision_count FROM issues WHERE issue_ref='issue-1';"
+    Assert ($rootRow.Count -eq 1) "root issue-1 row present in issues table"
+    Assert (($rootRow[0] -join ' ') -match 'issue-1' -and ($rootRow[0] -join ' ') -match '1\b') "root issue-1 revision_count bumped to 1 (got: $($rootRow[0] -join ' '))"
+
+    # --- publish learnings writes the dated file ---
+    $pubOut = & pwsh -NoProfile -NonInteractive -File (Join-Path $SrcDir 'publish-learnings.ps1') `
+        -ConfigPath (Join-Path $dir 'repo.config') -DataDir $dataDir 2>&1
+    $pubCode = $LASTEXITCODE
+    Assert ($pubCode -eq 0) "publish-learnings.ps1 exit 0 (output: $pubOut)"
+    $today = (Get-Date).ToString('yyyy-MM-dd')
+    $pubFile = Join-Path $dataDir 'learnings' "$today.md"
+    Assert (Test-Path -LiteralPath $pubFile) "dated learnings file written: $today.md"
+    $pubContent = Get-Content -LiteralPath $pubFile -Raw
+    Assert ($pubContent -match 'issue-2') "learnings file contains child issue-2"
+    Assert ($pubContent -match 'revision') "learnings file contains revision record"
+    # Second publish with no new items writes nothing (cursor advanced).
+    $pubOut2 = & pwsh -NoProfile -NonInteractive -File (Join-Path $SrcDir 'publish-learnings.ps1') `
+        -ConfigPath (Join-Path $dir 'repo.config') -DataDir $dataDir 2>&1
+    $pubCode2 = $LASTEXITCODE
+    Assert ($pubCode2 -eq 0) "second publish exit 0"
+    $pubContent2 = Get-Content -LiteralPath $pubFile -Raw
+    Assert ($pubContent2 -eq $pubContent) "second publish is a no-op — dated file unchanged"
+
+    Write-Host "SCENARIO revision PASSED"
 }
 
 # --- run ---
@@ -252,6 +442,7 @@ try {
     if ($Scenario -eq 'all' -or $Scenario -eq 'halt') { Test-Scenario 'halt' 'halt-conf' }
     if ($Scenario -eq 'all' -or $Scenario -eq 'fail') { Test-Scenario 'fail' 'fail' }
     if ($Scenario -eq 'all' -or $Scenario -eq 'missing') { Test-Scenario 'missing' 'missing' }
+    if ($Scenario -eq 'all' -or $Scenario -eq 'revision') { Test-RevisionScenario }
     Write-Host ""
     Write-Host "DRY-RUN E2E: ALL SCENARIOS PASSED"
     Write-Host "Temp workspace kept at: $TempBase (delete manually after inspection)"

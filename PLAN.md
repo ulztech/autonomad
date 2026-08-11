@@ -39,6 +39,10 @@ Bounded autonomy: the agent develops and opens PRs, but never merges, never auto
 | Q19 | Marketplace agents | **(b)** S- ships `dev.agent.md` + `verifier.agent.md` (verifier available from day one). |
 | Q20 | Success close-out | **Yes** — green PR sets `pending-review` + `Fixes #N`, then stops. Human approves/merges. |
 | Q21 | Reporting | **Add HTML** — per-issue artifact report (`reports/{issue-ref}.html`) in v1, plus `runs.log` + `learning.db` harvest. |
+| Q22 | Ticket tracking | Tracking ref = ticket number (#N). On claim, a canonical `## Tracking` comment (tracking_ref, root_ref, branch, PR URL) is posted as the single anchor for human + agent. |
+| Q23 | Revision loop | Revision = child ticket (`Parent: #N` + `revision:` feedback + `autonomous`). Root = no parent marker. **"1 PR and branch only"** — children reuse the root's branch and open PR; force-with-lease push; PR comment notes the revision; root's `Fixes #N` body intact. |
+| Q24 | Learnings publish | Manual only. `publish-learnings.ps1` aggregates unpublished knowledge (cursor = last published date) into `learnings/YYYY-MM-DD.md` under `learnings_dir`. No schedule, no GitHub push for now. Brain stays read-only. |
+| Q25 | Test delegation | `repo.config.test_runner` (optional): a heavier test runner a ticket can declare; the dev prompt delegates E2E/regression to it instead of a one-line `test_command`. |
 
 ---
 
@@ -61,6 +65,7 @@ autonomad/
 ├─ src/
 │  ├─ tick.ps1                 # pure-shell loop: claim → triage → adapt → report → harvest
 │  ├─ learn.ps1                # learning.db writes (decision/knowledge/lesson + harvest)
+│  ├─ publish-learnings.ps1    # manual learnings publish → learnings/YYYY-MM-DD.md (Phase 4)
 │  └─ report.ps1               # reports/{issue-ref}.html generator + runs.log append
 ├─ learning.db                 # SQLite, created on first tick (decision/knowledge/issues)
 ├─ reports/                    # per-issue HTML artifact reports
