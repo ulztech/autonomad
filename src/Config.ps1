@@ -18,7 +18,8 @@ $script:ConfigKeys = @(
     'repo', 'harness', 'model', 'test_command', 'build_command',
     'poll_interval', 'idle_timeout', 'ttl', 'max_retries', 'bot_login',
     'branch_prefix', 'base_branch', 'brain_paths',
-    'sandbox_timeout', 'progress_threshold', 'watch_poll', 'stall_kill'
+    'sandbox_timeout', 'progress_threshold', 'watch_poll', 'stall_kill',
+    'learnings_dir', 'test_runner'
 )
 
 <#
@@ -91,6 +92,12 @@ function Read-RepoConfig {
         $empty = @($cfg['brain_paths'] -split ',' | Where-Object { [string]::IsNullOrWhiteSpace($_) })
         if ($empty.Count -gt 0) {
             $errors += "brain_paths contains empty entries (got '$($cfg['brain_paths'])')"
+        }
+    }
+    # learnings_dir / test_runner: optional; non-empty when present.
+    foreach ($opt in @('learnings_dir', 'test_runner')) {
+        if ($cfg.Contains($opt) -and [string]::IsNullOrWhiteSpace($cfg[$opt])) {
+            $errors += "$opt must be a non-empty string when set (got empty)"
         }
     }
     if ($errors.Count -gt 0) {

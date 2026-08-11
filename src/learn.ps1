@@ -222,6 +222,49 @@ function Initialize-Db {
         return
     }
     Invoke-Sql -Sql $script:SchemaSql
+    # Phase 3 migration (idempotent): older DBs created before the revision loop
+    # lack revision_count + the revisions table. Skip when the schema is current.
+    if (-not (Test-DbTable 'revisions')) {
+        Invoke-Sql -Sql "CREATE TABLE IF NOT EXISTS revisions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            child_ref TEXT NOT NULL,
+            root_ref TEXT,
+            parent_ref TEXT,
+            request TEXT,
+            change_summary TEXT,
+            lesson TEXT,
+            created_at TEXT NOT NULL
+        );"
+        try {
+            Invoke-Sql -Sql 'ALTER TABLE issues ADD COLUMN revision_count INTEGER DEFAULT 0;'
+        } catch {
+            # column may already exist on a partially-migrated DB — ok
+        }
+    }
+}
+
+<#
+.SYNOPSIS
+  Return true when the named table exists in learning.db (used by the migration).
+#>
+function Test-DbTable {
+    param([string]$Name)
+    $checkSql = "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='$Name';"
+    switch ($script:Backend) {
+        'sqlite3cli' {
+            $cli = Get-SqliteCli
+            $n = & $cli $script:DbPath $checkSql
+            return ([string]($n | Select-Object -First 1)).Trim() -ne '0'
+        }
+        'python' {
+            $py = Get-PythonExe
+            $env:LEARN_DB = $script:DbPath
+            # Read SQL from stdin to avoid quoting issues (matches Invoke-Sql).
+            $n = $checkSql | & $py -c "import sqlite3,os,sys; con=sqlite3.connect(os.environ['LEARN_DB']); print(con.execute(sys.stdin.read()).fetchone()[0])" 2>$null
+            return ([string]($n | Select-Object -First 1)).Trim() -ne '0'
+        }
+    }
+    return $false
 }
 
 # ============================================================
@@ -267,13 +310,57 @@ function Add-IssueSummary {
     $issueRef = Get-IssueRef
     if (-not $State) { return }
     $outcome = $State.status
+    $revCount = 0
+    if ($State.PSObject.Properties.Name -contains 'revision_count') { $revCount = [int]$State.revision_count }
     $sql = @"
-INSERT INTO issues (issue_ref, repo, title, status, outcome, pr_url, confidence, attempts, created_at, updated_at)
-VALUES ('$($State.issue_ref.Replace("'", "''"))','$($State.repo.Replace("'", "''"))','$(($State.issue.title -replace "'", "''"))','$($State.status.Replace("'", "''"))','$outcome','$($State.pr_url)',$($State.confidence),$($State.attempts),'$($State.created_at)','$((Get-Date).ToUniversalTime().ToString('o'))')
-ON CONFLICT(issue_ref) DO UPDATE SET status=excluded.status, outcome=excluded.outcome, pr_url=excluded.pr_url, confidence=excluded.confidence, attempts=excluded.attempts, updated_at=excluded.updated_at;
+INSERT INTO issues (issue_ref, repo, title, status, outcome, pr_url, confidence, attempts, revision_count, created_at, updated_at)
+VALUES ('$($State.issue_ref.Replace("'", "''"))','$($State.repo.Replace("'", "''"))','$(($State.issue.title -replace "'", "''"))','$($State.status.Replace("'", "''"))','$outcome','$($State.pr_url)',$($State.confidence),$($State.attempts),$revCount,'$($State.created_at)','$((Get-Date).ToUniversalTime().ToString('o'))')
+ON CONFLICT(issue_ref) DO UPDATE SET status=excluded.status, outcome=excluded.outcome, pr_url=excluded.pr_url, confidence=excluded.confidence, attempts=excluded.attempts, revision_count=excluded.revision_count, updated_at=excluded.updated_at;
 "@
     Invoke-Sql -Sql $sql
     Write-Host "[learn] issue summary upserted (status=$outcome)"
+}
+
+<#
+.SYNOPSIS
+  Phase 3 — record a revision close-out as a lesson, and bump the revision_count
+  on the ROOT issue row. `request` comes from the child's `revision:` feedback;
+  `change_summary`/`lesson` describe what the revision changed.
+#>
+function Add-RevisionLesson {
+    $childRef = Get-IssueRef
+    if (-not $State) { return }
+    # Only revision children (root_ref present) produce revision lessons.
+    $rootRef = if ($State.PSObject.Properties.Name -contains 'root_ref') { $State.root_ref } else { $null }
+    if ($null -eq $rootRef) {
+        Write-Host "[learn] not a revision child (no root_ref) — no revision lesson"
+        return
+    }
+    # Root row: ensure it exists, then bump revision_count.
+    $rootIssueRef = "issue-$rootRef"
+    $ensureRoot = @"
+INSERT OR IGNORE INTO issues (issue_ref, repo, status, outcome, revision_count, created_at, updated_at)
+VALUES ('$rootIssueRef','$($State.repo.Replace("'", "''"))','revision-parent','revision',0,'$((Get-Date).ToUniversalTime().ToString('o'))','$((Get-Date).ToUniversalTime().ToString('o'))');
+UPDATE issues SET revision_count = revision_count + 1, updated_at = '$((Get-Date).ToUniversalTime().ToString('o'))' WHERE issue_ref = '$rootIssueRef';
+"@
+    Invoke-Sql -Sql $ensureRoot
+
+    # Extract the human's revision request from the child body (`revision:` prefix).
+    $request = ''
+    if ($State.PSObject.Properties.Name -contains 'issue' -and $State.issue.body) {
+        foreach ($line in @($State.issue.body -split "`n")) {
+            if ($line -match '(?i)^\s*revision\s*[:：]\s*(.*)$') { $request = $Matches[1].Trim(); break }
+        }
+    }
+    if (-not $request) { $request = 'revision requested' }
+    # Lesson = what changed. Best-effort: derive from the close-out summary fields.
+    $lesson = 'revision applied to root ' + $rootIssueRef + ' (request: ' + $request + ')'
+    $sql = @"
+INSERT INTO revisions (child_ref, root_ref, parent_ref, request, change_summary, lesson, created_at)
+VALUES ('$childRef','$rootIssueRef','$(if ($State.PSObject.Properties.Name -contains 'parent_ref') { $State.parent_ref } else { '' })','$($request.Replace("'", "''"))','','$($lesson.Replace("'", "''"))','$((Get-Date).ToUniversalTime().ToString('o'))')
+"@
+    Invoke-Sql -Sql $sql
+    Write-Host "[learn] revision lesson recorded for $childRef (root $rootIssueRef, revision_count+1)"
 }
 
 function Add-Harvest {
@@ -322,7 +409,7 @@ Initialize-Db
 switch ($Mode) {
     'decision'  { Add-Decision }
     'knowledge' { Add-Knowledge }
-    'closeout'  { Add-IssueSummary; Add-Harvest }
+    'closeout'  { Add-IssueSummary; Add-RevisionLesson; Add-Harvest }
     'harvest'   { Add-Harvest }
 }
 

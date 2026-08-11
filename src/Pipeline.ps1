@@ -38,7 +38,9 @@ function New-PipelineState {
         [string]$Harness = '',
         [string]$Model = '',
         [int]$MaxRetries = 2,
-        [hashtable]$IssueSnapshot = @{}
+        [hashtable]$IssueSnapshot = @{},
+        [object]$ParentRef = $null,     # issue number of the revision parent (#N from `Parent: #N`)
+        [object]$RootRef = $null        # issue number of the root ticket in the revision chain
     )
     $now = (Get-Date).ToUniversalTime().ToString('o')
     $gates = [ordered]@{}
@@ -56,6 +58,8 @@ function New-PipelineState {
         owner          = $Owner
         harness        = $Harness
         model          = $Model
+        parent_ref     = $ParentRef
+        root_ref       = $RootRef
         current_step   = 'claimed'
         next_gate      = 'implementation'
         gates          = $gates

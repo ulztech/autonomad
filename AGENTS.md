@@ -94,6 +94,29 @@ It never acts on `pending-review`, `reviewing`, `approved`, or `needs-human` iss
 
 ---
 
+## Rule 6b: Ticket tracking + revision loop
+
+- **Tracking ref = ticket number (#N).** On claim, autonomad posts a canonical
+  `## Tracking` comment: `tracking_ref #N`, `root_ref`, `branch`, `PR URL`. One
+  reference point for both human and agent.
+- **Root determination:** an issue whose body contains `Parent: #N` is a child;
+  no `Parent:` marker → it IS the root.
+- **Revision = child ticket.** The human OR the agent creates a child with body
+  `Parent: #N` + a `revision:` feedback line + the `autonomous` flag; the poll
+  picks it up like any other ticket.
+- **"1 PR and branch only":** every child of a root reuses the root's branch
+  (`autonomad/issue-<root>`) and the root's already-open PR. Never a new PR per
+  revision. On close-out: `git push --force-with-lease`, append a revision note
+  to the existing PR, keep the root's `Fixes #N` body intact.
+- **Review feedback is the instruction source**; the child ticket is the trigger
+  artifact (no comment-ID cursor).
+- **Learnings**: revision close-outs are recorded in `learning.db` (`revisions`
+  table + `revision_count` bumped on the root row). Publishing to
+  `learnings/YYYY-MM-DD.md` is a manual action (`publish-learnings.ps1`) — never
+  automatic.
+
+---
+
 ## Rule 7: Verification gate is test-only
 
 The dev flow does **not** self-review. It runs `build_command` and `test_command`

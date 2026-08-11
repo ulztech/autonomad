@@ -193,6 +193,8 @@ after every gate, so the next dispatcher start resumes exactly where it stopped.
 | `progress_threshold` | `60` s | After this with no progress, the watchdog warns (re-evaluate) |
 | `stall_kill` | `300` s | After this with no progress at all, watchdog kills + retries |
 | `watch_poll` | `15` s | Watchdog heartbeat interval |
+| `learnings_dir` | `<DataDir>/learnings` | Manual learnings publish destination (`YYYY-MM-DD.md`) |
+| `test_runner` | (unset) | Optional heavier test runner; dev prompt delegates E2E/regression to it instead of a one-line `test_command` |
 | `brain_paths` | … | AIOS brain dirs mounted read-only at `/brain/*` |
 
 > For production you may want to raise `sandbox_timeout`/`stall_kill` back to 1800/900 —
@@ -217,6 +219,51 @@ gh issue edit 12 --repo <owner>/<repo> --add-label ready-for-agent
 
 When it finishes: PR opened, label `in-progress` → `pending-review`, checklist ticked,
 summary comment posted. A human reviews/merges.
+
+---
+
+## 7b. Revision loop ("1 PR and branch only")
+
+After a human reviews a completed PR and wants changes, autonomad can revise it
+**in place** — never a new PR per revision:
+
+1. **Create a child ticket** (human or agent): body starts with `Parent: #<root>`
+   plus a `revision:` line carrying the feedback, and add the `autonomous` label.
+   ```bash
+   gh issue create --repo <owner>/<repo> --title "Revision: ..." \
+     --body "Parent: #12`n`nrevision: <the requested changes>" \
+     --label autonomous
+   ```
+2. Autonomad polls and claims the child. It resolves the **root** (walking
+   `Parent:` upward), reuses the root's branch (`autonomad/issue-<root>`), and
+   reuses the root's already-open PR — it never opens a new one.
+3. On close-out it force-pushes the branch (`git push --force-with-lease`), appends
+   a revision note to the existing PR, and returns the issue to `pending-review`.
+   The root's `Fixes #N` PR body stays intact.
+
+**Root determination:** an issue whose body contains `Parent: #N` is a child; an
+issue with no `Parent:` marker is the root. A claimed ticket always gets a
+canonical `## Tracking` comment (tracking_ref, root_ref, branch, PR URL) as the
+single reference point for both human and agent.
+
+---
+
+## 7c. Learnings publish (manual, EOD)
+
+Learnings accumulate in `learning.db` (SQLite, hash-deduped). They surface as a
+reviewable artifact only when you publish:
+
+```powershell
+pwsh -NoProfile -File src/publish-learnings.ps1 -DataDir "C:\path\to\autonomad-data"
+```
+
+- Aggregates **new** knowledge/decisions/issues since the last publish (cursor =
+  last published date) into `learnings/YYYY-MM-DD.md` under `learnings_dir`
+  (default `<DataDir>/learnings`).
+- No new items → no file written.
+- Publish is manual only — no schedule, no GitHub push yet.
+- Brain (`AI Docs`) stays read-only; `autonomad-data/learnings/` is the second
+  memory where dated artifacts land.
 
 ---
 

@@ -279,6 +279,42 @@ function Add-GateComment {
     Add-IssueComment -IssueNumber $IssueNumber -Body ($lines -join "`n")
 }
 
+<#
+.SYNOPSIS
+  Post the canonical `## Tracking` block on a claimed issue (Phase 2). This is
+  the single reference point both the human and autonomad anchor on: the ticket
+  number, its root ticket, the (possibly reused) branch, and the PR.
+  `tracking_ref` is the ticket number (#N); `root_ref` is the root of the
+  revision chain (equals tracking_ref for a root ticket).
+#>
+function Add-TrackingComment {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][int]$IssueNumber,
+        [Parameter(Mandatory = $true)][int]$TrackingRef,
+        [int]$RootRef = 0,
+        [string]$Branch = '',
+        [string]$PrUrl = ''
+    )
+    $lines = @(
+        '## Tracking',
+        '',
+        '| Field | Value |',
+        '|-------|-------|',
+        "| tracking_ref | #$TrackingRef |",
+        "| root_ref | #$(if ($RootRef -gt 0) { $RootRef } else { $TrackingRef }) |",
+        "| branch | $Branch |",
+        "| pr | $($PrUrl -replace '\|', '&#124;') |"
+    )
+    try {
+        Add-IssueComment -IssueNumber $IssueNumber -Body ($lines -join "`n")
+        $resolvedRoot = if ($RootRef -gt 0) { $RootRef } else { $TrackingRef }
+        Write-Log "Tracking comment posted for #$IssueNumber (tracking_ref #$TrackingRef, root #$resolvedRoot)"
+    } catch {
+        Write-Log "Tracking comment failed for #$IssueNumber : $($_.Exception.Message)" -Level 'WARN'
+    }
+}
+
 # ============================================================
 # Poll + claim
 # ============================================================
@@ -298,6 +334,50 @@ function Get-DependencyRefs {
     # `,@()` keeps the result an array even when empty (a bare empty array is
     # unrolled to $null on return, and .Count on $null throws under StrictMode).
     return ,@($refs | Sort-Object -Unique)
+}
+
+<#
+.SYNOPSIS
+  Extract the revision parent reference ("Parent: #N") from an issue body.
+  Returns the issue number as an int, or $null when the body declares no parent.
+  A ticket WITHOUT a `Parent: #N` marker IS the root of its revision chain.
+#>
+function Get-ParentRef {
+    [CmdletBinding()]
+    param([string]$Body)
+    if ([string]::IsNullOrWhiteSpace($Body)) { return $null }
+    foreach ($m in [regex]::Matches($Body, '(?i)parent\s*:\s*#(\d+)')) {
+        return [int]$m.Groups[1].Value
+    }
+    return $null
+}
+
+<#
+.SYNOPSIS
+  Resolve the ROOT ticket of a revision chain by walking `Parent: #N` upward.
+  A ticket with no parent marker IS the root (returns its own number). Cycle-
+  safe (a chain that loops back returns the current number to avoid an infinite
+  loop). Falls back to the current number when a parent cannot be fetched.
+#>
+function Resolve-RootRef {
+    [CmdletBinding()]
+    param(
+        [object]$Issue,
+        [hashtable]$Seen = @{}
+    )
+    if ($null -eq $Issue) { return $null }
+    $parent = Get-ParentRef -Body $Issue.body
+    if ($null -eq $parent) { return [int]$Issue.number }
+    if ($Seen.ContainsKey($Issue.number.ToString())) { return [int]$Issue.number }
+    $Seen[$Issue.number.ToString()] = $true
+    try {
+        $view = Invoke-Gh @('issue', 'view', "$parent", '--repo', $Config['repo'],
+            '--json', 'number,body') | ConvertFrom-Json
+        return Resolve-RootRef -Issue $view -Seen $Seen
+    } catch {
+        Write-Log "Cannot resolve parent #$parent for #$($Issue.number): $($_.Exception.Message) — treating as root" -Level 'WARN'
+        return [int]$Issue.number
+    }
 }
 
 <#
@@ -347,6 +427,37 @@ function Test-IssueBlocked {
         Set-IssueLabel -IssueNumber $Issue.number -Remove @('blocked')
     }
     return $false
+}
+
+<#
+.SYNOPSIS
+  Safely read a property off a state object. Under StrictMode, accessing a
+  missing property throws; older workspaces (pre revision loop) have no
+  parent_ref/root_ref, so every read must be guarded.
+#>
+function Get-StateProp {
+    [CmdletBinding()]
+    param([object]$State, [string]$Name)
+    if ($null -eq $State) { return $null }
+    if ($State -is [System.Collections.IDictionary]) {
+        return if ($State.Contains($Name)) { $State[$Name] } else { $null }
+    }
+    if ($State.PSObject.Properties.Name -contains $Name) { return $State.$Name }
+    return $null
+}
+
+<#
+.SYNOPSIS
+  True when the state belongs to a revision child (root_ref set and != its own
+  issue number), i.e. it must reuse the root's branch + open PR.
+#>
+function Test-IsRevisionChild {
+    [CmdletBinding()]
+    param([object]$State)
+    $root = Get-StateProp -State $State -Name 'root_ref'
+    if ($null -eq $root) { return $false }
+    $own = Get-StateProp -State $State -Name 'issue_number'
+    return ([int]$root -ne [int]$own)
 }
 
 function Get-CandidateIssue {
@@ -491,6 +602,11 @@ function Checkout-IssueBranch {
         } else {
             git checkout -b "$Branch" 2>&1 | Out-Null
             if ($LASTEXITCODE -ne 0) { throw "git checkout -b $Branch failed" }
+            # `git clone --no-checkout` leaves an empty index, so `git checkout -b`
+            # creates the branch without populating the working tree. Force a full
+            # checkout so the dev agent sees the repo's files.
+            git reset --hard HEAD 2>&1 | Out-Null
+            if ($LASTEXITCODE -ne 0) { throw "git reset --hard after checkout -b failed" }
         }
     } finally { Pop-Location }
 }
@@ -561,6 +677,10 @@ $(if ($Issue) { $Issue.body } else { '' })
 - Model override: $(if ($State.model) { $State.model } else { '<harness default>' })
 - Build command: $($Config['build_command'])
 - Test command: $($Config['test_command'])
+$(if ($Config['test_runner']) {
+@"
+- Test runner (delegated): $($Config['test_runner'])
+"@ } else { '' })
 
 ## Pipeline state (current)
 - current_step: $($State.current_step)
@@ -575,6 +695,15 @@ $gatesText
 branch_guard -> implementation -> tester_gate -> review_gate -> security_gate -> verifier_gate -> commit_push -> artifact_report -> github_sync -> human_approval
 
 Resume from `next_gate` if it is not the first gate. Do NOT re-run completed gates.
+
+$(if ($Config['test_runner']) {
+@"
+## Test strategy (delegated)
+A heavier test runner is configured: `$($Config['test_runner'])`. Do NOT rely on a
+one-line test_command for verification. Delegate E2E / regression verification to
+the AIOS sandbox / regression flow via the configured runner and report its result
+as the tester_gate evidence.
+"@ } else { '' })
 
 ## AIOS brain (READ-ONLY)
 The brain is mounted read-only at:
@@ -635,31 +764,95 @@ function Read-ResultJson {
 # ============================================================
 # Close-out (T6)
 # ============================================================
+<#
+.SYNOPSIS
+  Find an existing OPEN PR whose head branch matches $Branch. Used by the
+  revision loop (Phase 1): a child ticket reuses the ROOT's already-open PR
+  instead of opening a new one. Returns the PR object or $null.
+#>
+function Get-OpenPrForBranch {
+    [CmdletBinding()]
+    param([string]$Branch)
+    try {
+        $json = Invoke-Gh @('pr', 'list', '--repo', $Config['repo'], '--head', $Branch,
+            '--state', 'open', '--json', 'number,url,title') | ConvertFrom-Json
+        $items = @($json)
+        if ($items.Count -eq 0) { return $null }
+        return $items[0]
+    } catch {
+        Write-Log "Cannot list PRs for head ${Branch}: $($_.Exception.Message)" -Level 'WARN'
+        return $null
+    }
+}
+
+<#
+.SYNOPSIS
+  Append a comment to an existing PR (revision note on the reused root PR).
+#>
+function Add-PrComment {
+    [CmdletBinding()]
+    param([string]$PrNumber, [string]$Body)
+    $bodyFile = Join-Path $script:DataDir "pr-comment-$PrNumber.md"
+    [System.IO.File]::WriteAllText($bodyFile, $Body, (New-Object System.Text.UTF8Encoding($false)))
+    Invoke-Gh @('pr', 'comment', "$PrNumber", '--repo', $Config['repo'], '--body-file', $bodyFile) | Out-Null
+    Remove-Item -LiteralPath $bodyFile -Force
+}
+
 function Close-OutIssue {
     [CmdletBinding()]
     param([object]$State, [object]$Issue, [string]$Workspace)
 
     $branch = $State.branch
     $issueRef = $State.issue_ref
+    # A child (revision) ticket reuses the ROOT's branch and PR — never a new PR.
+    $isChild = Test-IsRevisionChild -State $State
 
-    # Push branch
+    # Push branch (force-with-lease for a revision reusing the root branch)
     Push-Location $Workspace
     try {
-        git push -u origin "$branch" 2>&1 | Out-Null
-        if ($LASTEXITCODE -ne 0) { throw "git push failed for branch $branch" }
+        if ($isChild) {
+            git push --force-with-lease origin "$branch" 2>&1 | Out-Null
+            if ($LASTEXITCODE -ne 0) { throw "git push --force-with-lease failed for branch $branch" }
+        } else {
+            git push -u origin "$branch" 2>&1 | Out-Null
+            if ($LASTEXITCODE -ne 0) { throw "git push failed for branch $branch" }
+        }
     } finally { Pop-Location }
     Write-Log "Pushed branch $branch"
 
-    # PR
-    $prBody = "Fixes #$($State.issue_number)`n`nAutonomad v1 — developed autonomously. See the report for details."
-    $prBodyFile = Join-Path $script:DataDir "pr-body-$issueRef.md"
-    [System.IO.File]::WriteAllText($prBodyFile, $prBody, (New-Object System.Text.UTF8Encoding($false)))
-    $prOut = Invoke-Gh @('pr', 'create', '--repo', $Config['repo'], '--title', "Autonomad: $($Issue.title)",
-        '--body-file', $prBodyFile, '--head', $branch, '--base', $Config['base_branch']) | Out-String
-    Remove-Item -LiteralPath $prBodyFile -Force
-    $prUrl = ($prOut | Select-String -Pattern 'https://github.com/.*/pull/\d+' | Select-Object -First 1).Matches.Value
-    if (-not $prUrl) { $prUrl = $prOut.Trim() }
-    Write-Log "PR created: $prUrl"
+    # PR — reuse the root's open PR for a child; create a fresh PR otherwise.
+    $prUrl = $null
+    $prNum = $null
+    if ($isChild) {
+        $existing = Get-OpenPrForBranch -Branch $branch
+        if ($existing) {
+            $prUrl = $existing.url
+            $prNum = [string]$existing.number
+            Write-Log "Revision close-out: reusing open PR #$prNum for branch $branch"
+        }
+    }
+    if (-not $prUrl) {
+        $prBody = "Fixes #$($State.issue_number)`n`nAutonomad v1 — developed autonomously. See the report for details."
+        $prBodyFile = Join-Path $script:DataDir "pr-body-$issueRef.md"
+        [System.IO.File]::WriteAllText($prBodyFile, $prBody, (New-Object System.Text.UTF8Encoding($false)))
+        $prOut = Invoke-Gh @('pr', 'create', '--repo', $Config['repo'], '--title', "Autonomad: $($Issue.title)",
+            '--body-file', $prBodyFile, '--head', $branch, '--base', $Config['base_branch']) | Out-String
+        Remove-Item -LiteralPath $prBodyFile -Force
+        $prUrl = ($prOut | Select-String -Pattern 'https://github.com/.*/pull/\d+' | Select-Object -First 1).Matches.Value
+        if (-not $prUrl) { $prUrl = $prOut.Trim() }
+        $m = [regex]::Match($prUrl, 'pull/(\d+)')
+        if ($m.Success) { $prNum = $m.Groups[1].Value }
+        Write-Log "PR created: $prUrl"
+    }
+    # Revision note on the reused root PR (the root's `Fixes #N` body stays intact).
+    if ($isChild -and $prNum) {
+        try {
+            Add-PrComment -PrNumber $prNum -Body "Autonomad revision for #$($State.issue_number) — re-requesting review. See child ticket #$($State.issue_number) for the requested changes."
+            Write-Log "Revision note appended to PR #$prNum"
+        } catch {
+            Write-Log "Revision PR comment failed: $($_.Exception.Message)" -Level 'WARN'
+        }
+    }
 
     # Label pending-review
     Set-IssueLabel -IssueNumber $State.issue_number -Add @('pending-review') -Remove @('in-progress')
@@ -788,6 +981,19 @@ function Process-Issue {
     $branch = "$($Config['branch_prefix'])/$issueRef"
     $workspace = Join-Path $script:WorkspacesDir $issueRef
 
+    # --- revision parent/root resolution (Phase 0/1) ---
+    # A child ticket (`Parent: #N` in the body) reuses the ROOT's branch and
+    # open PR — never a new branch/PR per revision.
+    $parentRef = Get-ParentRef -Body $Issue.body
+    $rootRef = $null
+    if ($null -ne $parentRef) {
+        $rootRef = Resolve-RootRef -Issue $Issue
+        if ($null -ne $rootRef) {
+            $branch = "$($Config['branch_prefix'])/issue-$rootRef"
+            Write-Log "#$issueNum is a revision child of #$parentRef (root #$rootRef) — reusing branch $branch"
+        }
+    }
+
     # --- resume vs new ---
     $state = $null
     if ($Resume) {
@@ -805,11 +1011,14 @@ function Process-Issue {
         Checkout-IssueBranch -Workspace $workspace -Branch $branch
         $state = New-PipelineState -IssueNumber $issueNum -Repo $Config['repo'] -Branch $branch `
             -Owner $Config['bot_login'] -Harness $Config['harness'] -Model $Config['model'] `
-            -MaxRetries ([int]$Config['max_retries']) -IssueSnapshot (New-IssueSnapshot -Issue $Issue)
+            -MaxRetries ([int]$Config['max_retries']) -IssueSnapshot (New-IssueSnapshot -Issue $Issue) `
+            -ParentRef $parentRef -RootRef $rootRef
         $state.status = 'in_progress'
         $state.updated_at = (Get-Date).ToUniversalTime().ToString('o')
         Commit-PipelineState -Workspace $workspace -State $state -Message "gate 0: claim #$issueNum (branch_guard)"
         Write-Log "Gate 0 complete: branch_guard"
+        # Phase 2 — canonical tracking comment (tracking_ref #N / root_ref / branch / PR URL).
+        Add-TrackingComment -IssueNumber $issueNum -TrackingRef $issueNum -RootRef ($rootRef ?? $issueNum) -Branch $branch
     }
 
     $prompt = Build-DevPrompt -State $state -Issue $Issue -BrainPath $script:BrainRoot

@@ -79,12 +79,39 @@ switch ($cmd) {
                 $label = Get-FlagValue $rest '--label'
                 $assignee = Get-FlagValue $rest '--assignee'
                 $limit = [int](Get-FlagValue $rest '--limit')
+                $search = Get-FlagValue $rest '--search'
                 $items = @()
                 foreach ($p in $state.issues.PSObject.Properties) {
                     $iss = $p.Value
                     if ($iss.state -ne 'OPEN') { continue }
                     if ($label -and ($iss.labels -notcontains $label)) { continue }
                     if ($assignee -eq 'none' -and $iss.assignees.Count -gt 0) { continue }
+                    # Minimal `--search` support (tick polls with the search API):
+                    #   is:open            — open only (already applied above)
+                    #   no:assignee        — unassigned
+                    #   assignee:<login>   — assigned to <login>
+                    #   label:"X" / label:X — carries label X
+                    if ($search) {
+                        if ($search -match '\bno:assignee\b' -and $iss.assignees.Count -gt 0) { continue }
+                        $m = [regex]::Match($search, 'assignee:([A-Za-z0-9_.-]+)')
+                        if ($m.Success -and ($iss.assignees -notcontains $m.Groups[1].Value)) { continue }
+                        $wantedLabels = @([regex]::Matches($search, 'label:"([^"]+)"|label:([A-Za-z0-9_.-]+)') | ForEach-Object {
+                            if ($_.Groups[1].Value) { $_.Groups[1].Value } else { $_.Groups[2].Value }
+                        })
+                        if ($wantedLabels.Count -gt 0) {
+                            $isOr = ($search -match '\bOR\b')
+                            if ($isOr) {
+                                # OR semantics: issue must carry at least one of the labels.
+                                $hasAny = $false
+                                foreach ($w in $wantedLabels) { if ($iss.labels -contains $w) { $hasAny = $true } }
+                                if (-not $hasAny) { continue }
+                            } else {
+                                $hasAll = $true
+                                foreach ($w in $wantedLabels) { if ($iss.labels -notcontains $w) { $hasAll = $false } }
+                                if (-not $hasAll) { continue }
+                            }
+                        }
+                    }
                     $items += $iss
                     if ($limit -gt 0 -and $items.Count -ge $limit) { break }
                 }
@@ -152,6 +179,36 @@ switch ($cmd) {
         }
     }
     'pr' {
+        if ($rest[0] -eq 'list') {
+            $repo = Get-FlagValue $rest '--repo'
+            $head = Get-FlagValue $rest '--head'
+            $stateOpen = Get-FlagValue $rest '--state'
+            $items = @()
+            if ($state.prs) {
+                foreach ($p in @($state.prs.PSObject.Properties | ForEach-Object { $_.Value })) {
+                    if ($head -and $p.head -ne $head) { continue }
+                    if ($stateOpen -and $p.state -ne 'OPEN') { continue }
+                    $items += $p
+                }
+            }
+            if ($items.Count -eq 0) {
+                Write-Output '[]'
+            } elseif ($items.Count -eq 1) {
+                Write-Output ("[" + ($items[0] | ConvertTo-Json -Compress -Depth 6) + "]")
+            } else {
+                $items | ConvertTo-Json -Compress -Depth 6
+            }
+            exit 0
+        }
+        if ($rest[0] -eq 'comment') {
+            $prNum = [int]$rest[1]
+            $repo = Get-FlagValue $rest '--repo'
+            $bodyFile = Get-FlagValue $rest '--body-file'
+            $body = if ($bodyFile -and (Test-Path -LiteralPath $bodyFile)) { Get-Content -LiteralPath $bodyFile -Raw } else { '' }
+            Add-Event 'pr_comment' @{ pr = $prNum; body = $body.Trim() }
+            Write-Output "commented on PR #$prNum"
+            exit 0
+        }
         if ($rest[0] -ne 'create') { throw "mock-gh: unsupported pr subcommand: $($rest[0])" }
         $repo = Get-FlagValue $rest '--repo'
         $head = Get-FlagValue $rest '--head'
@@ -160,6 +217,11 @@ switch ($cmd) {
         $prNum = [int]$state.next_pr
         $state.next_pr = $prNum + 1
         $url = "https://github.com/$repo/pull/$prNum"
+        if (-not $state.PSObject.Properties['prs']) {
+            $state | Add-Member -NotePropertyName 'prs' -NotePropertyValue ([pscustomobject]@{})
+        }
+        $newPr = [pscustomobject]@{ number = $prNum; head = $head; state = 'OPEN'; url = $url }
+        $state.prs | Add-Member -NotePropertyName "pr$prNum" -NotePropertyValue $newPr -Force
         Add-Event 'pr_create' @{ repo = $repo; head = $head; body = $body.Trim(); pr = $prNum; url = $url }
         Save-State $state
         Write-Output $url
