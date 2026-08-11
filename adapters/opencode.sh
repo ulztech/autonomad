@@ -111,6 +111,9 @@ load_marketplace() {
                 printf 'permission:\n'
                 printf '  edit: allow\n'
                 printf '  bash: allow\n'
+                printf '  external_directory:\n'
+                printf '    "/opt/autonomad/marketplace/**": allow\n'
+                printf '    "/brain/**": allow\n'
                 printf -- '---\n'
                 printf '\n'
                 printf '%s\n' "$body"

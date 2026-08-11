@@ -231,10 +231,15 @@ function Invoke-Sandbox {
             $elapsed = [math]::Round($sw.Elapsed.TotalSeconds, 0)
 
             # LIVE PROGRESS: tail `docker logs` since the last poll and print it.
+            # A growing log is itself progress: an agent emitting commands is alive
+            # and working, even between pipeline-state commits (deep research phases
+            # legitimately run many minutes before the first commit).
+            $logGrew = $false
             $logs = & docker logs --tail $([int]1e9) $containerName 2>&1 | Out-String
             if ($logs) {
                 $logLines = @($logs -split "`n" | Where-Object { $_ -ne '' })
                 if ($logLines.Count -gt $lastLogLen) {
+                    $logGrew = $true
                     foreach ($l in $logLines[$lastLogLen..($logLines.Count - 1)]) {
                         Write-Host "  [agent] $l"
                     }
@@ -264,6 +269,10 @@ function Invoke-Sandbox {
             }
             if ($gitHead -and $gitHead -ne $lastGitHead) {
                 $lastGitHead = $gitHead
+                $lastProgress = (Get-Date).ToUniversalTime()
+                $stalledPolls = 0
+            }
+            if ($logGrew) {
                 $lastProgress = (Get-Date).ToUniversalTime()
                 $stalledPolls = 0
             }
