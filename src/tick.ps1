@@ -341,8 +341,22 @@ function Get-DependencyRefs {
     param([string]$Body)
     if ([string]::IsNullOrWhiteSpace($Body)) { return ,@() }
     $refs = @()
-    foreach ($m in [regex]::Matches($Body, '(?i)(?:depends\s+on|blocked\s+by)\s+#(\d+)')) {
-        $refs += [int]$m.Groups[1].Value
+    # Match the dependency marker (`Depends on #N` / `Blocked by #N`), capturing the
+    # first issue number — inline (`Blocked by #316`) or the first bullet under a
+    # "## Blocked by" heading (`- #316 — title`).
+    $marker = [regex]::Match($Body, '(?i)(?:depends\s+on|blocked\s+by)\s*:?\s*-\s*#(\d+)')
+    if (-not $marker.Success) {
+        $marker = [regex]::Match($Body, '(?i)(?:depends\s+on|blocked\s+by)\s*:?\s*#(\d+)')
+    }
+    if ($marker.Success) {
+        $refs += [int]$marker.Groups[1].Value
+        # Capture additional bullets on subsequent lines of a list:
+        #   - #5 — first dep
+        #   - #6 — second dep
+        $rest = $Body.Substring($marker.Index + $marker.Length)
+        foreach ($m in [regex]::Matches($rest, '(?m)^\s*-\s*#(\d+)')) {
+            $refs += [int]$m.Groups[1].Value
+        }
     }
     # `,@()` keeps the result an array even when empty (a bare empty array is
     # unrolled to $null on return, and .Count on $null throws under StrictMode).
@@ -359,7 +373,12 @@ function Get-ParentRef {
     [CmdletBinding()]
     param([string]$Body)
     if ([string]::IsNullOrWhiteSpace($Body)) { return $null }
-    foreach ($m in [regex]::Matches($Body, '(?i)parent\s*:\s*#(\d+)')) {
+    # Parent may be written as `Parent: #N` or as a URL under a "## Parent" heading:
+    #   ## Parent
+    #   https://github.com/ulztech/HRSystem-Legacy/issues/313
+    #   - https://github.com/ulztech/HRSystem-Legacy/issues/313
+    # Match the number from either form (a URL's trailing /issues/<N> is captured).
+    foreach ($m in [regex]::Matches($Body, '(?i)parent\s*[:：]?\s*(?:-\s*)?(?:https?://[^\s]+/issues/|#)(\d+)')) {
         return [int]$m.Groups[1].Value
     }
     return $null
@@ -388,7 +407,37 @@ function Resolve-RootRef {
             '--json', 'number,body') | ConvertFrom-Json
         return Resolve-RootRef -Issue $view -Seen $Seen
     } catch {
-        Write-Log "Cannot resolve parent #$parent for #$($Issue.number): $($_.Exception.Message) — treating as root" -Level 'WARN'
+        Write-Log "Cannot resolve root parent for #$($Issue.number): $($_.Exception.Message)" -Level 'WARN'
+        return [int]$Issue.number
+    }
+}
+
+<#
+.SYNOPSIS
+  Resolve the CHAIN root of a sequential ticket chain (e.g. #316 blocked by
+  nothing -> #317 blocked by #316 -> ...). Walks `Blocked by` / `Depends on`
+  links up to the head of the chain — the ticket that has NO dependencies. The
+  chain root owns the shared branch + PR that every child reuses. Cycle-safe.
+  Falls back to the current number when a dependency cannot be fetched.
+#>
+function Resolve-ChainRootRef {
+    [CmdletBinding()]
+    param(
+        [object]$Issue,
+        [hashtable]$Seen = @{}
+    )
+    if ($null -eq $Issue) { return $null }
+    $deps = Get-DependencyRefs -Body $Issue.body
+    if ($deps.Count -eq 0) { return [int]$Issue.number }
+    if ($Seen.ContainsKey($Issue.number.ToString())) { return [int]$Issue.number }
+    $Seen[$Issue.number.ToString()] = $true
+    $dep = ($deps | Sort-Object)[0]
+    try {
+        $view = Invoke-Gh @('issue', 'view', "$dep", '--repo', $Config['repo'],
+            '--json', 'number,body') | ConvertFrom-Json
+        return Resolve-ChainRootRef -Issue $view -Seen $Seen
+    } catch {
+        Write-Log "Cannot resolve chain root for #$($Issue.number): $($_.Exception.Message)" -Level 'WARN'
         return [int]$Issue.number
     }
 }
@@ -487,6 +536,19 @@ function Get-CandidateIssue {
     # collapses a one-element JSON array to a scalar).
     $items = @($json | ConvertFrom-Json)
     if ($items.Count -eq 0) { return $null }
+    # Single-flight guard (Q3): never claim a new ticket while ANY other OPEN
+    # issue carries the bot's `in-progress` claim. This is the "one in-progress at
+    # a time" invariant — protects against stale-label races and the chain being
+    # jumped ahead of while a sibling is still mid-flight.
+    $inProgress = Invoke-Gh @('issue', 'list', '--repo', $Config['repo'],
+        '--search', 'is:open label:"in-progress"',
+        '--json', 'number,labels,assignees') | ConvertFrom-Json
+    foreach ($ip in @($inProgress)) {
+        if ($ip.number -ne $items[0].number -and (Test-IssueClaimedByBot -Issue $ip)) {
+            Write-Log "Single-flight: #$($ip.number) still in-progress — holding new claims" -Level 'DEBUG'
+            return $null
+        }
+    }
     # Dependency-aware selection: claim the LOWEST-numbered UNBLOCKED ticket.
     $unblocked = @()
     foreach ($item in @($items | Sort-Object { [int]$_.number })) {
@@ -514,6 +576,7 @@ function Claim-Issue {
     $out = & $script:GhBin issue edit "$IssueNumber" --repo $Config['repo'] `
         --add-assignee $Config['bot_login'] `
         --remove-label 'autonomous' `
+        --remove-label 'ready-for-agent' `
         --add-label 'in-progress' 2>&1
     if ($LASTEXITCODE -ne 0) {
         # Lost the race / label moved -> not ours.
@@ -589,6 +652,7 @@ function Initialize-Workspace {
             git fetch --all 2>&1 | Out-Null
             if ($LASTEXITCODE -ne 0) { throw "git fetch failed in $Workspace" }
         } finally { Pop-Location }
+        Add-AutonomadGitignore -Workspace $Workspace
         return
     }
     if (-not (Test-Path -LiteralPath $Workspace)) { New-Item -ItemType Directory -Path $Workspace -Force | Out-Null }
@@ -598,6 +662,30 @@ function Initialize-Workspace {
         git clone --no-checkout (Get-RepoCloneUrl) $Workspace 2>&1 | Out-Null
         if ($LASTEXITCODE -ne 0) { throw "git clone failed for $Workspace" }
     } finally { Pop-Location }
+    Add-AutonomadGitignore -Workspace $Workspace
+}
+
+<#
+.SYNOPSIS
+  Append Autonomad-internal paths to the workspace .gitignore so the dev agent's
+  commits and the repo PR never ship pipeline-state.json / .autonomad/ artifacts.
+  These are Autonomad runtime state, not product code.
+#>
+function Add-AutonomadGitignore {
+    [CmdletBinding()]
+    param([string]$Workspace)
+    $gi = Join-Path $Workspace '.gitignore'
+    $lines = @(
+        '',
+        '# --- Autonomad runtime artifacts (never shipped in PRs) ---',
+        '.autonomad/',
+        'pipeline-state.json'
+    )
+    $existing = if (Test-Path -LiteralPath $gi) { Get-Content -LiteralPath $gi -Raw } else { '' }
+    foreach ($l in $lines) {
+        if ($existing -match [regex]::Escape($l.Trim())) { continue }
+        Add-Content -LiteralPath $gi -Value $l
+    }
 }
 
 function Checkout-IssueBranch {
@@ -669,6 +757,24 @@ function Build-DevPrompt {
 
     $brain = if ($BrainPath) { $BrainPath } else { '<AIOS_BRAIN_PATH not set>' }
 
+    # Prior-context injection: pull previously-captured learnings for this repo so
+    # the run starts warm instead of re-reading files. Filtered by repo so each
+    # target repo only sees its own knowledge.
+    $priorLearnings = @()
+    try {
+        $repoFilter = $State.repo
+        # Keep only the knowledge bullets (learn.ps1 emits an info-stream header line too).
+        $priorLearnings = @(& (Join-Path $PSScriptRoot 'learn.ps1') -DataDir $script:DataDir -Mode query -Source $repoFilter 2>$null |
+            Where-Object { $_ -match '^-\s+\[' })
+    } catch {
+        Write-Log "Learnings query failed (continuing cold): $($_.Exception.Message)" -Level 'WARN'
+    }
+    $priorText = if ($priorLearnings.Count -gt 0) {
+        "Prior repo context (from the learning store — verified by earlier runs; trust it and skip re-reading those files):`n" + (($priorLearnings | ForEach-Object { $_.Trim() }) -join "`n")
+    } else {
+        'No prior learnings for this repo yet.'
+    }
+
     return @"
 # Autonomad dev task — $(if ($Issue) { $Issue.title })
 
@@ -679,6 +785,19 @@ Develop the issue described below. Load the repo-native marketplace skills and c
 AIOS brain (read-only) where helpful. Follow the pipeline-state gates strictly: complete each
 gate in order, run the build and test commands green BEFORE advancing, and commit
 pipeline-state.json after every gate.
+
+## Prior context (from learning store)
+$priorText
+
+## Shared learning store (LIVE — read + append)
+The tick loop mounts the shared learning dir at /learnings (read-write). It contains:
+- repo-context-<repo>.md — cumulative prior context for THIS repo; read it during
+  research to avoid re-reading files you have already mapped.
+- session files (issue-<N>.jsonl) — append one JSON line per finding you want to
+  persist: {"knowledge": "...", "source": "<repo>", "confidence": 0.9}
+At the END of the session the tick loop ingests your session file into learning.db
+(deduped) and future runs start warm. Also list findings in result.json.learnings.
+Never put secrets or PII in learnings.
 
 ## Issue
 Title: $(if ($Issue) { $Issue.title } else { $State.issue_ref })
@@ -749,8 +868,14 @@ Report your outcome in /workspace/.autonomad/result.json with this shape:
   "confidence": 0.0-1.0,
   "fatal_flaw": bool,
   "plan_escalation": bool,
-  "summary": "short summary"
+  "summary": "short summary",
+  "learnings": [ { "knowledge": "...", "source": "issue-N", "confidence": 0.9 } ]
 }
+`learnings` is optional but encouraged: capture repo context facts you discovered
+during research (migration/seed homes, naming conventions, charset decisions,
+build/test quirks) so future runs start warm instead of re-reading files. Set
+`source` to the repo (e.g. ulztech/HRSystem-Legacy) for reusable context — the
+tick loop persists them (deduped) and injects prior learnings into the next prompt.
 "@
 }
 
@@ -772,6 +897,65 @@ function Read-ResultJson {
         Write-Log "result.json unreadable: $($_.Exception.Message)" -Level 'WARN'
         return $null
     }
+}
+
+<#
+.SYNOPSIS
+  Persist the dev agent's research learnings into the learning store so future
+  runs start warm. Sources (both optional):
+   1. result.json.learnings (fallback) — agent-reported findings.
+   2. <DataDir>/learnings/issue-<N>.jsonl (primary) — live-append session file
+      the agent wrote during the run. Each line is one JSON object.
+  Called after every dev run, before halt/retry/success handling, so findings are
+  captured even on failure.
+#>
+function Persist-Learnings {
+    [CmdletBinding()]
+    param([object]$AgentResult, [string]$Workspace, [string]$IssueRef, [string]$IssueNumber)
+    $recorded = 0
+
+    # Source 1: live session file (shared learning store mount).
+    $learningsDir = Join-Path $script:DataDir 'learnings'
+    $sessionFile = Join-Path $learningsDir "issue-$IssueNumber.jsonl"
+    if (Test-Path -LiteralPath $sessionFile) {
+        foreach ($line in Get-Content -LiteralPath $sessionFile) {
+            if ([string]::IsNullOrWhiteSpace($line)) { continue }
+            try {
+                $item = $line | ConvertFrom-Json
+                $knowledge = [string]$item.knowledge
+                if ([string]::IsNullOrWhiteSpace($knowledge)) { continue }
+                $conf = 0.9
+                if ($null -ne $item.confidence) { $conf = [math]::Round([double]$item.confidence, 2) }
+                $source = if ([string]::IsNullOrWhiteSpace([string]$item.source)) { "issue-$IssueNumber" } else { [string]$item.source }
+                & (Join-Path $PSScriptRoot 'learn.ps1') -DataDir $script:DataDir -Mode knowledge `
+                    -Knowledge $knowledge -Source $source -Confidence $conf 2>&1 | ForEach-Object { Write-Log "[learn] $_" }
+                $recorded++
+            } catch {
+                Write-Log "Skipping malformed learnings line: $($_.Exception.Message)" -Level 'WARN'
+            }
+        }
+        # Ingested once — archive it so it is not re-processed.
+        $archiveDir = Join-Path $learningsDir 'archive'
+        if (-not (Test-Path -LiteralPath $archiveDir)) { New-Item -ItemType Directory -Path $archiveDir -Force | Out-Null }
+        Move-Item -LiteralPath $sessionFile -Destination (Join-Path $archiveDir (Split-Path $sessionFile -Leaf)) -Force
+    }
+
+    # Source 2: result.json.learnings (fallback).
+    if ($AgentResult) {
+        $learnings = @($AgentResult.learnings)
+        foreach ($item in $learnings) {
+            $knowledge = [string]$item.knowledge
+            if ([string]::IsNullOrWhiteSpace($knowledge)) { continue }
+            $conf = 0.9
+            if ($null -ne $item.confidence) { $conf = [math]::Round([double]$item.confidence, 2) }
+            $source = if ([string]::IsNullOrWhiteSpace([string]$item.source)) { "issue-$IssueNumber" } else { [string]$item.source }
+            & (Join-Path $PSScriptRoot 'learn.ps1') -DataDir $script:DataDir -Mode knowledge `
+                -Knowledge $knowledge -Source $source -Confidence $conf 2>&1 | ForEach-Object { Write-Log "[learn] $_" }
+            $recorded++
+        }
+    }
+
+    Write-Log "Persisted $recorded learning(s) from $IssueRef"
 }
 
 # ============================================================
@@ -857,18 +1041,28 @@ function Close-OutIssue {
         if ($m.Success) { $prNum = $m.Groups[1].Value }
         Write-Log "PR created: $prUrl"
     }
-    # Revision note on the reused root PR (the root's `Fixes #N` body stays intact).
+    # Note on the reused root PR (the root's `Fixes #N` body stays intact). Covers
+    # BOTH revision children (Parent: #N) and sequential chain children (Blocked by
+    # #N) — each pushes to the shared root branch so reviewers see cumulative work.
     if ($isChild -and $prNum) {
         try {
-            Add-PrComment -PrNumber $prNum -Body "Autonomad revision for #$($State.issue_number) — re-requesting review. See child ticket #$($State.issue_number) for the requested changes."
-            Write-Log "Revision note appended to PR #$prNum"
+            $rootRef = Get-StateProp -State $State -Name 'root_ref'
+            Add-PrComment -PrNumber $prNum -Body "Autonomad added #$($State.issue_number) to this PR (root #$rootRef) — re-requesting review. The branch now includes the work from tickets sharing branch $($State.branch)."
+            Write-Log "Chain note appended to PR #$prNum for #$($State.issue_number)"
         } catch {
-            Write-Log "Revision PR comment failed: $($_.Exception.Message)" -Level 'WARN'
+            Write-Log "Chain PR comment failed: $($_.Exception.Message)" -Level 'WARN'
         }
     }
 
-    # Label pending-review
-    Set-IssueLabel -IssueNumber $State.issue_number -Add @('pending-review') -Remove @('in-progress')
+    # Label pending-review + leave the queue: drop ready-for-agent so a closed-out
+    # issue never re-polls, and unassign the bot (its work is done).
+    Set-IssueLabel -IssueNumber $State.issue_number -Add @('pending-review') -Remove @('in-progress', 'ready-for-agent')
+    try {
+        Invoke-Gh @('issue', 'edit', "$($State.issue_number)", '--repo', $Config['repo'],
+            '--remove-assignee', $Config['bot_login']) | Out-Null
+    } catch {
+        Write-Log "Unassign on close-out failed for #$($State.issue_number): $($_.Exception.Message)" -Level 'WARN'
+    }
 
     # Update state
     $State.status = 'pending-review'
@@ -908,7 +1102,7 @@ function Halt-Issue {
         Commit-PipelineState -Workspace (Join-Path $script:WorkspacesDir $State.issue_ref) -State $State -Message "halt: needs-human"
     }
     try {
-        Set-IssueLabel -IssueNumber $State.issue_number -Add @('needs-human') -Remove @('in-progress', 'autonomous')
+        Set-IssueLabel -IssueNumber $State.issue_number -Add @('needs-human') -Remove @('in-progress', 'autonomous', 'ready-for-agent')
         # Structured gate comment (display-sync pattern) replaces the ad-hoc line.
         Add-GateComment -IssueNumber $State.issue_number -Gate ($State.current_step ?? 'halt') `
             -Status 'blocked' -Summary "Autonomad halted and needs a human. Reason: $Reason"
@@ -940,31 +1134,40 @@ function Find-ResumableIssue {
             Write-Log "Skipping $($dir.Name): needs-human" -Level 'DEBUG'
             continue
         }
-        if ($state.status -in @('claimed', 'in_progress')) {
+        # `done` = the dev agent finished ALL gates inside the sandbox but the tick
+        # was killed before close-out (push + PR). It MUST be resumed for close-out
+        # (no sandbox) — otherwise the PR never opens and the issue strands with the
+        # bot's in-progress claim.
+        $isResumableDone = ($state.status -eq 'done')
+        if ($state.status -in @('claimed', 'in_progress', 'done')) {
             # TTL-stale -> HALT with needs-human + comment (m7). Silently skipping
             # would strand the claim: the issue keeps the bot's assignee and the
             # in-progress label forever, so no human or bot can pick it up.
-            $age = $null
-            try {
-                $updated = [datetime]::Parse($state.updated_at)
-                $age = ((Get-Date).ToUniversalTime() - $updated).TotalSeconds
-            } catch {
-                Write-Log "Resume scan: unparseable updated_at in $($dir.Name): $($_.Exception.Message)" -Level 'WARN'
-            }
-            if ($null -eq $age) {
-                # Cannot compute staleness -> do not blindly resume; leave it for
-                # the next run (fails closed without stranding anything new).
-                Write-Log "Skipping $($dir.Name): cannot compute age (no TTL handling)" -Level 'WARN'
-                continue
-            }
-            if ($age -gt $ttlSeconds) {
-                Write-Log "TTL-stale $($dir.Name) ($([math]::Round($age))s > ${ttlSeconds}s) — halting with needs-human" -Level 'WARN'
+            # A `done` state skips the TTL check: the work is finished, so staleness
+            # is meaningless — only close-out (push + PR) remains.
+            if (-not $isResumableDone) {
+                $age = $null
                 try {
-                    Halt-Issue -State $state -Reason "TTL-stale: in-progress for $([math]::Round($age))s (ttl=${ttlSeconds}s); Autonomad halted the stranded claim"
+                    $updated = [datetime]::Parse($state.updated_at)
+                    $age = ((Get-Date).ToUniversalTime() - $updated).TotalSeconds
                 } catch {
-                    Write-Log "TTL-stale halt failed for $($dir.Name): $($_.Exception.Message)" -Level 'ERROR'
+                    Write-Log "Resume scan: unparseable updated_at in $($dir.Name): $($_.Exception.Message)" -Level 'WARN'
                 }
-                continue
+                if ($null -eq $age) {
+                    # Cannot compute staleness -> do not blindly resume; leave it for
+                    # the next run (fails closed without stranding anything new).
+                    Write-Log "Skipping $($dir.Name): cannot compute age (no TTL handling)" -Level 'WARN'
+                    continue
+                }
+                if ($age -gt $ttlSeconds) {
+                    Write-Log "TTL-stale $($dir.Name) ($([math]::Round($age))s > ${ttlSeconds}s) — halting with needs-human" -Level 'WARN'
+                    try {
+                        Halt-Issue -State $state -Reason "TTL-stale: in-progress for $([math]::Round($age))s (ttl=${ttlSeconds}s); Autonomad halted the stranded claim"
+                    } catch {
+                        Write-Log "TTL-stale halt failed for $($dir.Name): $($_.Exception.Message)" -Level 'ERROR'
+                    }
+                    continue
+                }
             }
             # Confirm the issue is still open + assigned to bot
             try {
@@ -997,9 +1200,24 @@ function Process-Issue {
     # --- revision parent/root resolution (Phase 0/1) ---
     # A child ticket (`Parent: #N` in the body) reuses the ROOT's branch and
     # open PR — never a new branch/PR per revision.
+    # A CHAIN child (`Blocked by #N` in a sequential chain, e.g. #317 blocked by
+    # #316) reuses the CHAIN ROOT's branch + open PR: the whole chain ships as one
+    # PR so reviewers see the cumulative work. Chain-root resolution takes
+    # precedence over the revision-parent resolution for these tickets.
     $parentRef = Get-ParentRef -Body $Issue.body
     $rootRef = $null
-    if ($null -ne $parentRef) {
+    $chainDeps = Get-DependencyRefs -Body $Issue.body
+    $isChainChild = $false
+    if ($chainDeps.Count -gt 0) {
+        $chainRoot = Resolve-ChainRootRef -Issue $Issue
+        if ($null -ne $chainRoot -and $chainRoot -ne $issueNum) {
+            $rootRef = $chainRoot
+            $branch = "$($Config['branch_prefix'])/issue-$chainRoot"
+            $isChainChild = $true
+            Write-Log "#$issueNum is a chain child of root #$chainRoot (blocked by $($chainDeps -join ',')) — reusing branch $branch"
+        }
+    }
+    if (-not $isChainChild -and $null -ne $parentRef) {
         $rootRef = Resolve-RootRef -Issue $Issue
         if ($null -ne $rootRef) {
             $branch = "$($Config['branch_prefix'])/issue-$rootRef"
@@ -1035,6 +1253,21 @@ function Process-Issue {
     }
 
     $prompt = Build-DevPrompt -State $state -Issue $Issue -BrainPath $script:BrainRoot
+
+    # --- done-state fast-path: work finished, only close-out remains ---
+    # The dev agent completed ALL gates in the sandbox (pipeline-state.status = done)
+    # but the previous tick was killed before close-out. Skip re-provisioning a
+    # sandbox — push the branch and open/reuse the PR directly.
+    if ($state.status -eq 'done' -or (Test-PipelineComplete -State $state)) {
+        Write-Log "Resuming completed #$issueNum (all gates done) — close-out only, no sandbox."
+        $newState = Close-OutIssue -State $state -Issue $Issue -Workspace $workspace
+        Write-PipelineState -Path (Join-Path $workspace 'pipeline-state.json') -State $newState | Out-Null
+        Commit-PipelineState -Workspace $workspace -State $newState -Message "close-out: PR created"
+        & (Join-Path $PSScriptRoot 'learn.ps1') -State $newState -Workspace $workspace -DataDir $script:DataDir -Mode closeout
+        if ($LASTEXITCODE -ne 0) { Write-Log "learn.ps1 (closeout) failed (exit $LASTEXITCODE)" -Level 'WARN' }
+        Write-Log "DONE #$issueNum — PR $($newState.pr_url) pending human review."
+        return
+    }
 
     # --- run sandbox (dev agent) ---
     $result = Invoke-Sandbox -Config $Config -State $state -Workspace $workspace -Prompt $prompt `
@@ -1072,6 +1305,9 @@ function Process-Issue {
     }
     $agentResult = Read-ResultJson -Workspace $workspace
     $outcome = if ($agentResult -and $agentResult.outcome) { $agentResult.outcome } else { $newState.status }
+
+    # --- persist research learnings into the learning store (capture even on halt/failure) ---
+    Persist-Learnings -AgentResult $agentResult -Workspace $workspace -IssueRef $issueRef -IssueNumber $issueNum
 
     # --- live display sync (Phase 3): mirror dev-agent gate progress on the issue ---
     Sync-IssueChecklist -IssueNumber $issueNum -State $newState

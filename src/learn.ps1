@@ -29,7 +29,7 @@ param(
     [object]$State,             # pipeline state object (for closeout/decision modes)
     [string]$Workspace = '',    # issue workspace (to scan for knowledge artifacts)
     [string]$DataDir = '',
-    [ValidateSet('decision', 'knowledge', 'closeout', 'harvest')]
+    [ValidateSet('decision', 'knowledge', 'closeout', 'harvest', 'query')]
     [string]$Mode = 'harvest',
     [string]$Gate = '',
     [string]$Decision = '',
@@ -363,6 +363,50 @@ VALUES ('$childRef','$rootIssueRef','$(if ($State.PSObject.Properties.Name -cont
     Write-Host "[learn] revision lesson recorded for $childRef (root $rootIssueRef, revision_count+1)"
 }
 
+<#
+.SYNOPSIS
+  Mode query — print prior knowledge for a repo (optionally filtered by keyword)
+  as a compact bullet list on stdout. Used by Build-DevPrompt so a fresh run
+  starts warm with previously-captured repo context instead of re-reading files.
+#>
+function Get-Knowledge {
+    if ($script:Backend -eq 'jsonl') {
+        $records = @(Read-JsonlRecords | Where-Object { $_._table -eq 'knowledge' })
+        $filtered = $records | Where-Object {
+            (-not $Knowledge -or $_.knowledge -like "*$Knowledge*") -and
+            (-not $Source -or $_.source -like "*$Source*")
+        }
+        foreach ($r in $filtered) { Write-Output "- [$($r.source)] $($r.knowledge)" }
+        return
+    }
+    $where = @()
+    if ($Knowledge) { $where += "knowledge LIKE '%$($Knowledge.Replace("'", "''"))%'" }
+    if ($Source)    { $where += "source LIKE '%$($Source.Replace("'", "''"))%'" }
+    $clause = if ($where.Count -gt 0) { "WHERE " + ($where -join " AND ") } else { '' }
+    $sql = "SELECT source, knowledge FROM knowledge $clause ORDER BY created_at DESC;"
+    $rows = @()
+    if ($script:Backend -eq 'python') {
+        $py = Get-PythonExe
+        $env:LEARN_DB = $script:DbPath
+        $out = $sql | & $py -c "import sqlite3, os, sys, json; con=sqlite3.connect(os.environ['LEARN_DB']); con.row_factory=sqlite3.Row; cur=con.cursor(); cur.execute(sys.stdin.read()); rows=[dict(r) for r in cur.fetchall()]; print(json.dumps(rows))" 2>$null
+        if (-not [string]::IsNullOrWhiteSpace(($out -join ''))) { $rows = @(($out -join "`n") | ConvertFrom-Json) }
+    } else {
+        $cli = Get-SqliteCli
+        $tmp = Join-Path ([System.IO.Path]::GetTempPath()) "learn-query-$([guid]::NewGuid().ToString('N')).json"
+        try {
+            & $cli -json $script:DbPath $sql 1> $tmp
+            if ($LASTEXITCODE -ne 0) { throw "sqlite3 query failed: $sql" }
+            if (Test-Path -LiteralPath $tmp) {
+                $raw = Get-Content -LiteralPath $tmp -Raw
+                if (-not [string]::IsNullOrWhiteSpace($raw)) { $rows = @($raw | ConvertFrom-Json) }
+            }
+        } finally {
+            Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue
+        }
+    }
+    foreach ($r in $rows) { Write-Output "- [$($r.source)] $($r.knowledge)" }
+}
+
 function Add-Harvest {
     # Post-run harvest: dedupe knowledge and summarize what was learned.
     if ($script:Backend -eq 'jsonl') {
@@ -411,6 +455,7 @@ switch ($Mode) {
     'knowledge' { Add-Knowledge }
     'closeout'  { Add-IssueSummary; Add-RevisionLesson; Add-Harvest }
     'harvest'   { Add-Harvest }
+    'query'     { Get-Knowledge }
 }
 
 exit 0

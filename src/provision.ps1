@@ -56,6 +56,7 @@ function New-SandboxCommand {
         [Parameter(Mandatory = $true)][string]$PromptFile,
         [string]$BrainRoot,
         [string]$EnvFile,
+        [string]$DataDir = '',
         [string]$Image = '',
         [string]$Adapter = '',
         [string]$ContainerName = ''
@@ -80,6 +81,17 @@ function New-SandboxCommand {
     $cmd = @('docker', 'run', '-d', '--name', $ContainerName)
     # Workspace (issue branch) read-write.
     $cmd += @('-v', "${Workspace}:/workspace")
+    # Shared learning store (autonomad-data/learnings) read-write so the dev agent
+    # can READ prior repo context and APPEND per-session learnings live. The tick
+    # loop ingests the session files into learning.db after the run.
+    if (-not [string]::IsNullOrWhiteSpace($DataDir)) {
+        $learningsHost = Join-Path $DataDir 'learnings'
+        if (-not (Test-Path -LiteralPath $learningsHost)) {
+            New-Item -ItemType Directory -Path $learningsHost -Force | Out-Null
+        }
+        $cmd += @('-v', "${learningsHost}:/learnings")
+        $cmd += @('-e', 'AUTONOMAD_LEARNINGS=/learnings')
+    }
     # AIOS brain read-only at corrected paths.
     $brainMounts = Get-BrainMounts -BrainRoot $BrainRoot -Config $Config
     foreach ($m in $brainMounts) { $cmd += @('-v', $m) }
@@ -139,6 +151,87 @@ function New-SandboxCommand {
     return $cmd
 }
 
+# ============================================================
+# Real-time agent status (Fix 8)
+# ============================================================
+<#
+.SYNOPSIS
+  Poll the LIVE agent status for one sandbox and render a one-line status that
+  CHANGES ONLY when the ticket gate or the agent's todo list changes. Sources:
+    - todo table in the container's opencode.db (status/content per todo)
+    - pipeline-state.json (current/next gate)
+  Prints a fresh line per change (never per-poll), and writes the same line to
+  <workspace>/.autonomad/status so it can be tailed externally. Returns a status
+  hash so callers know whether anything changed.
+#>
+function Get-AgentStatus {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$ContainerName,
+        [Parameter(Mandatory = $true)][string]$Workspace,
+        [Parameter(Mandatory = $true)][string]$StatePath,
+        [Parameter(Mandatory = $true)][object]$State,
+        [int]$ElapsedSeconds
+    )
+    $statusFile = Join-Path $Workspace '.autonomad' 'status'
+
+    # --- ticket gate (pipeline-state) ---
+    $gateLabel = '?'
+    $gateProgress = ''
+    $doneCount = 0
+    $total = 0
+    if (Test-Path -LiteralPath $StatePath) {
+        try {
+            $ps = Get-Content -LiteralPath $StatePath -Raw | ConvertFrom-Json
+            if ($ps.next_gate) {
+                $gateLabel = $ps.next_gate
+                $doneCount = @($ps.completed | Where-Object { $_ -ne '' }).Count
+                $total = $doneCount + @($ps.pending | Where-Object { $_ -ne '' }).Count
+                if ($total -gt 0) { $gateProgress = " $doneCount/$total" }
+            }
+        } catch { }
+    }
+
+    # --- todo list (container opencode.db) ---
+    $todoText = ''
+    $todoCount = '0/0'
+    $todoDone = 0
+    $todoJson = $null
+    try {
+        $todoJson = & docker exec $ContainerName sqlite3 -json /root/.local/share/opencode/opencode.db `
+            "SELECT status,position,content FROM todo WHERE session_id=(SELECT id FROM session ORDER BY time_created DESC LIMIT 1) ORDER BY position" 2>$null
+    } catch { $todoJson = $null }
+    if ($todoJson) {
+        try {
+            $todos = @($todoJson | ConvertFrom-Json)
+            $total = [Math]::Max($total, $todos.Count)
+            $todoDone = @($todos | Where-Object { $_.status -eq 'completed' }).Count
+            $todoCount = "$todoDone/$($todos.Count)"
+            $active = $todos | Where-Object { $_.status -eq 'in_progress' } | Select-Object -First 1
+            if ($active -and $active.content) {
+                $short = [string]$active.content
+                if ($short.Length -gt 45) { $short = $short.Substring(0, 42) + '...' }
+                $todoText = " `"$short`""
+            }
+        } catch { }
+    }
+
+    # --- render ---
+    $issueRef = $State.issue_ref
+    $mins = [math]::Round($ElapsedSeconds / 60, 1)
+    $line = "[$issueRef] gate$gateProgress ($gateLabel) | todo $todoCount$todoText | ${mins}m"
+    $autoDir = Join-Path $Workspace '.autonomad'
+    if (-not (Test-Path -LiteralPath $autoDir)) { New-Item -ItemType Directory -Path $autoDir -Force | Out-Null }
+    [System.IO.File]::WriteAllText($statusFile, $line + "`n", (New-Object System.Text.UTF8Encoding($false)))
+
+    # Hash the CHANGE-SIGNAL (gate + todo statuses + active content) so callers
+    # can print only when it actually changes.
+    $signal = "$gateLabel|$($doneCount + $todoDone)|$total|$todoText"
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+    $bytes = [System.Text.Encoding]::UTF8.GetBytes($signal)
+    return @{ Line = $line; Hash = ([System.BitConverter]::ToString($sha.ComputeHash($bytes))).Replace('-', '') }
+}
+
 <#
 .SYNOPSIS
   Invoke the sandbox for an issue. Returns $LASTEXITCODE-equivalent result object.
@@ -176,7 +269,7 @@ function Invoke-Sandbox {
         throw "Sandbox provisioning failed: docker CLI not found (set AUTONOMAD_SANDBOX_MODE=mock to dry-run)."
     }
     $cmd = New-SandboxCommand -Config $Config -Workspace $Workspace -PromptFile $promptFile `
-        -BrainRoot $BrainRoot -EnvFile $EnvFile -ContainerName "autonomad-sandbox-$($State.issue_ref)"
+        -BrainRoot $BrainRoot -EnvFile $EnvFile -DataDir $DataDir -ContainerName "autonomad-sandbox-$($State.issue_ref)"
     $containerName = "autonomad-sandbox-$($State.issue_ref)"
     Write-Host "SANDBOX: docker run -d --name $containerName (workspace=$Workspace, brain=$BrainRoot)"
 
@@ -224,27 +317,34 @@ function Invoke-Sandbox {
     $killReason = $null
     $lastGitHead = $null
     $lastLogLen = 0
+    $lastStatusHash = $null
 
     try {
         while ($true) {
             Start-Sleep -Seconds $watchPoll
             $elapsed = [math]::Round($sw.Elapsed.TotalSeconds, 0)
 
-            # LIVE PROGRESS: tail `docker logs` since the last poll and print it.
-            # A growing log is itself progress: an agent emitting commands is alive
-            # and working, even between pipeline-state commits (deep research phases
-            # legitimately run many minutes before the first commit).
+            # LIVE PROGRESS: a growing `docker logs` is itself progress — the agent
+            # is emitting commands even between pipeline-state commits. The raw log
+            # is NOT echoed to the console (too noisy); instead the compact status
+            # line below updates only when the ticket gate or todo list changes.
             $logGrew = $false
             $logs = & docker logs --tail $([int]1e9) $containerName 2>&1 | Out-String
             if ($logs) {
                 $logLines = @($logs -split "`n" | Where-Object { $_ -ne '' })
                 if ($logLines.Count -gt $lastLogLen) {
                     $logGrew = $true
-                    foreach ($l in $logLines[$lastLogLen..($logLines.Count - 1)]) {
-                        Write-Host "  [agent] $l"
-                    }
                     $lastLogLen = $logLines.Count
                 }
+            }
+
+            # Real-time status: render only when gate/todo actually changed, write
+            # to .autonomad/status, and print a fresh line per change.
+            $status = Get-AgentStatus -ContainerName $containerName -Workspace $Workspace `
+                -StatePath $statePath -State $State -ElapsedSeconds $elapsed
+            if ($status.Hash -ne $lastStatusHash) {
+                Write-Host "STATUS: $($status.Line)"
+                $lastStatusHash = $status.Hash
             }
 
             # Heartbeat + progress probe. Progress is EITHER:

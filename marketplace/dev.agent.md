@@ -24,6 +24,18 @@ The tick loop assembles a prompt containing:
 Load repo-native skills from the marketplace and AIOS brain skills where helpful.
 The brain at `/brain` is **strictly read-only** — never write to it.
 
+## Shared learning store (live)
+
+The shared learning dir is mounted read-write at `/learnings`:
+- **Read** `repo-context-<repo>.md` (if present) during research — prior context
+  from earlier runs on this repo. Trust it; skip re-reading those files.
+- **Append** findings as you discover them to `/learnings/issue-<N>.jsonl` — one
+  JSON object per line: `{"knowledge": "...", "source": "<repo>", "confidence": 0.9}`.
+- The tick loop ingests your session file into `learning.db` (deduped by hash) at
+  the end of the run, and future runs start warm.
+- Also list findings in `result.json.learnings` (fallback).
+- Never put secrets or PII in learnings.
+
 ## Gates (must honor)
 
 Run each gate in order. **Do not advance a gate until `build_command` and
@@ -66,8 +78,22 @@ Write `/workspace/.autonomad/result.json` on completion:
   "confidence": 0.0,
   "fatal_flaw": false,
   "plan_escalation": false,
-  "summary": "short summary"
+  "summary": "short summary",
+  "learnings": [
+    { "knowledge": "migration home is HRDatabase/MySql/2026 NET 8/",
+      "source": "ulztech/HRSystem-Legacy", "confidence": 0.95 },
+    { "knowledge": "patchlogs pattern = SET @key; DDL; DELETE/INSERT",
+      "source": "ulztech/HRSystem-Legacy", "confidence": 0.9 }
+  ]
 }
 ```
+
+`learnings` is **optional** but strongly encouraged. Capture **repo context
+facts you discovered during research** so future runs start warm instead of
+re-reading files: migration/seed homes, naming conventions, charset decisions,
+build/test quirks, relevant brain/graph findings. Keep each entry short and
+reusable. Set `source` to the **repo** (e.g. `ulztech/HRSystem-Legacy`) for
+reusable context — the tick loop filters prior learnings by repo and injects
+them into the next run's prompt.
 
 Commit all work to the issue branch. The tick loop handles push + PR.
