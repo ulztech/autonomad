@@ -1017,16 +1017,15 @@ function Close-OutIssue {
     } finally { Pop-Location }
     Write-Log "Pushed branch $branch"
 
-    # PR — reuse the root's open PR for a child; create a fresh PR otherwise.
+    # PR — reuse an existing open PR on this branch (root/child/chain OR a prior
+    # close-out that already opened it, e.g. done-state resume), else create fresh.
     $prUrl = $null
     $prNum = $null
-    if ($isChild) {
-        $existing = Get-OpenPrForBranch -Branch $branch
-        if ($existing) {
-            $prUrl = $existing.url
-            $prNum = [string]$existing.number
-            Write-Log "Revision close-out: reusing open PR #$prNum for branch $branch"
-        }
+    $existing = Get-OpenPrForBranch -Branch $branch
+    if ($existing) {
+        $prUrl = $existing.url
+        $prNum = [string]$existing.number
+        Write-Log "Close-out: reusing open PR #$prNum for branch $branch"
     }
     if (-not $prUrl) {
         $prBody = "Fixes #$($State.issue_number)`n`nAutonomad v1 — developed autonomously. See the report for details."
