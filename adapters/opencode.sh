@@ -52,9 +52,10 @@ run_agent() {
     local code=1
     local m
     for m in "${models[@]}"; do
-        echo "[opencode] running dev agent (model=$m)"
+        echo "[opencode] running dev agent (model=$m, variant=high)"
         # `opencode run` is the headless, non-interactive mode.
-        opencode run --model "$m" --agent dev "$prompt"
+        # --variant high: provider-specific reasoning effort (high-effort deepseek).
+        opencode run --model "$m" --variant high --agent dev "$prompt"
         code=$?
         if [ "$code" -eq 0 ]; then
             echo "[opencode] agent exited with code $code (model=$m)"

@@ -27,6 +27,8 @@ param(
     [string]$GhBin = '',
     [string]$EnvFile = '',
     [string]$BrainRoot = '',
+    [string]$Repo = '',          # runtime override for repo.config repo (owner/name)
+    [string]$BaseBranch = '',    # runtime override for repo.config base_branch
     [int]$MaxTicks = 0          # 0 = unlimited (tests cap this)
 )
 
@@ -53,7 +55,18 @@ $script:GhBin = if ($GhBin) { $GhBin } else {
 
 # --- load config + env ---
 $Config = Read-RepoConfig -ConfigPath $ConfigPath
-Import-EnvFile -EnvFilePath $EnvFile
+Import-EnvFile -EnvFilePath $EnvFile | Out-Null
+
+# --- runtime repo/base_branch overrides (win over repo.config) ---
+if ($Repo) {
+    if ($Repo -notmatch '^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$') {
+        throw "repo must be owner/name (got '$Repo')"
+    }
+    $Config['repo'] = $Repo
+}
+if ($BaseBranch) {
+    $Config['base_branch'] = $BaseBranch
+}
 $script:BrainRoot = if ($BrainRoot) { $BrainRoot } else {
     [System.Environment]::GetEnvironmentVariable('AIOS_BRAIN_PATH')
 }
