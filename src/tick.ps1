@@ -166,7 +166,7 @@ function Ensure-Labels {
 }
 
 function Set-IssueLabel {
-    param([int]$IssueNumber, [string[]]$Add, [string[]]$Remove)
+    param([int]$IssueNumber, [string[]]$Add = @(), [string[]]$Remove = @())
     if ($Add.Count -gt 0) {
         Invoke-Gh @('issue', 'edit', "$IssueNumber", '--repo', $Config['repo'], '--add-label', ($Add -join ',')) | Out-Null
     }
@@ -480,6 +480,20 @@ function Test-IssueBlocked {
     foreach ($dep in $deps) {
         $st = Get-IssueState -IssueNumber $dep
         if ($st -eq 'OPEN') {
+            # A dependency that is DONE but awaiting human review (pending-review)
+            # no longer blocks: its work is complete and downstream tickets can
+            # proceed on the shared chain branch. Only actively-open deps block.
+            # A needs-human dep is NOT complete — it still blocks.
+            $depLabels = @()
+            try {
+                $depView = Invoke-Gh @('issue', 'view', "$dep", '--repo', $Config['repo'],
+                    '--json', 'labels') | ConvertFrom-Json
+                $depLabels = Get-IssueLabelNames -Issue $depView
+            } catch { }
+            if ($depLabels -contains 'pending-review') {
+                Write-Log "#$($Issue.number): dep #$dep is pending-review — not blocking" -Level 'DEBUG'
+                continue
+            }
             Set-IssueLabel -IssueNumber $Issue.number -Add @('blocked')
             Write-Log "#$($Issue.number) blocked by open dependency #$dep" -Level 'DEBUG'
             return $true
@@ -489,6 +503,32 @@ function Test-IssueBlocked {
         Set-IssueLabel -IssueNumber $Issue.number -Remove @('blocked')
     }
     return $false
+}
+
+<#
+.SYNOPSIS
+  Find open issues that declare #IssueNumber as a dependency ("Blocked by #N" /
+  "Depends on #N") and remove their `blocked` label. Called when an issue moves
+  to pending-review so its chain children are unblocked for the next tick.
+#>
+function Unblock-Dependents {
+    [CmdletBinding()]
+    param([Parameter(Mandatory = $true)][int]$IssueNumber)
+    try {
+        $search = 'is:open label:"blocked"'
+        $json = Invoke-Gh @('issue', 'list', '--repo', $Config['repo'],
+            '--search', $search,
+            '--json', 'number,body,labels') | ConvertFrom-Json
+        foreach ($item in @($json)) {
+            $deps = Get-DependencyRefs -Body $item.body
+            if ($deps -contains $IssueNumber) {
+                Set-IssueLabel -IssueNumber $item.number -Remove @('blocked')
+                Write-Log "Unblocked #$($item.number) (dependency #$IssueNumber is now pending-review)"
+            }
+        }
+    } catch {
+        Write-Log "Unblock-Dependents failed for #$IssueNumber : $($_.Exception.Message)" -Level 'WARN'
+    }
 }
 
 <#
@@ -540,10 +580,16 @@ function Get-CandidateIssue {
     # issue carries the bot's `in-progress` claim. This is the "one in-progress at
     # a time" invariant — protects against stale-label races and the chain being
     # jumped ahead of while a sibling is still mid-flight.
-    $inProgress = Invoke-Gh @('issue', 'list', '--repo', $Config['repo'],
-        '--search', 'is:open label:"in-progress"',
-        '--json', 'number,labels,assignees') | ConvertFrom-Json
-    foreach ($ip in @($inProgress)) {
+    $inProgress = @()
+    try {
+        $inProgress = @((Invoke-Gh @('issue', 'list', '--repo', $Config['repo'],
+            '--search', 'is:open label:"in-progress"',
+            '--json', 'number,labels,assignees') | ConvertFrom-Json))
+    } catch {
+        Write-Log "Single-flight probe failed (proceeding): $($_.Exception.Message)" -Level 'DEBUG'
+    }
+    foreach ($ip in $inProgress) {
+        if ($null -eq $ip -or $null -eq $ip.number) { continue }
         if ($ip.number -ne $items[0].number -and (Test-IssueClaimedByBot -Issue $ip)) {
             Write-Log "Single-flight: #$($ip.number) still in-progress — holding new claims" -Level 'DEBUG'
             return $null
@@ -674,17 +720,24 @@ function Initialize-Workspace {
 function Add-AutonomadGitignore {
     [CmdletBinding()]
     param([string]$Workspace)
-    $gi = Join-Path $Workspace '.gitignore'
+    # Use .git/info/exclude (repo-local, never committed, survives branch switches)
+    # rather than a working-tree .gitignore — an untracked .gitignore would block
+    # git checkout when switching to a remote branch that already has one.
+    $gitDir = Join-Path $Workspace '.git'
+    $excludeFile = Join-Path $gitDir 'info' 'exclude'
+    if (-not (Test-Path -LiteralPath (Join-Path $gitDir 'info'))) {
+        New-Item -ItemType Directory -Path (Join-Path $gitDir 'info') -Force | Out-Null
+    }
     $lines = @(
         '',
         '# --- Autonomad runtime artifacts (never shipped in PRs) ---',
         '.autonomad/',
         'pipeline-state.json'
     )
-    $existing = if (Test-Path -LiteralPath $gi) { Get-Content -LiteralPath $gi -Raw } else { '' }
+    $existing = if (Test-Path -LiteralPath $excludeFile) { Get-Content -LiteralPath $excludeFile -Raw } else { '' }
     foreach ($l in $lines) {
         if ($existing -match [regex]::Escape($l.Trim())) { continue }
-        Add-Content -LiteralPath $gi -Value $l
+        Add-Content -LiteralPath $excludeFile -Value $l
     }
 }
 
@@ -695,11 +748,19 @@ function Checkout-IssueBranch {
     try {
         $branches = git branch -a 2>&1
         if ($LASTEXITCODE -ne 0) { throw 'git branch -a failed' }
-        $branchExists = ($branches | Select-String -SimpleMatch "origin/$Branch") -ne $null -or
-                        ($branches | Select-String -SimpleMatch "  $Branch") -ne $null
-        if ($branchExists) {
+        $branchExistsLocal = ($branches | Select-String -SimpleMatch "  $Branch") -ne $null -or
+                             ($branches | Select-String -SimpleMatch "* $Branch") -ne $null
+        $branchExistsRemote = ($branches | Select-String -SimpleMatch "origin/$Branch") -ne $null
+        if ($branchExistsLocal) {
             git checkout "$Branch" 2>&1 | Out-Null
             if ($LASTEXITCODE -ne 0) { throw "git checkout $Branch failed" }
+        } elseif ($branchExistsRemote) {
+            # Remote branch exists (e.g. a chain root's shared branch, or a resumed
+            # run's pushed branch). Create the local tracking branch from it so the
+            # dev agent works on the exact same branch the PR points at.
+            git checkout -b "$Branch" "origin/$Branch" 2>&1 | Out-Null
+            if ($LASTEXITCODE -ne 0) { throw "git checkout -b $Branch origin/$Branch failed" }
+            Add-AutonomadGitignore -Workspace $Workspace
         } else {
             git checkout -b "$Branch" 2>&1 | Out-Null
             if ($LASTEXITCODE -ne 0) { throw "git checkout -b $Branch failed" }
@@ -1062,6 +1123,9 @@ function Close-OutIssue {
     } catch {
         Write-Log "Unassign on close-out failed for #$($State.issue_number): $($_.Exception.Message)" -Level 'WARN'
     }
+    # The completed issue's work is done — clear the `blocked` label on any open
+    # issue that declared this one as a dependency (chain children can now proceed).
+    Unblock-Dependents -IssueNumber $State.issue_number
 
     # Update state
     $State.status = 'pending-review'
@@ -1519,6 +1583,7 @@ while ($true) {
         $candidate = Get-CandidateIssue
     } catch {
         Write-Log "Poll failed: $($_.Exception.Message)" -Level 'ERROR'
+        Write-Log "Poll script-stack: $($_.ScriptStackTrace -split "`n" | Select-Object -First 6)" -Level 'DEBUG'
     }
 
     if (-not $candidate) {
@@ -1543,6 +1608,7 @@ while ($true) {
             Process-Issue -Issue $candidate
         } catch {
             Write-Log "Issue processing failed: $($_.Exception.Message)" -Level 'ERROR'
+            Write-Log "Issue proc stack: $($_.ScriptStackTrace -split "`n" | Select-Object -First 6)" -Level 'DEBUG'
             # Fails closed on unexpected errors -> needs-human on the claimed issue.
             try {
                 Halt-Issue -State (New-PipelineState -IssueNumber $candidate.number -Repo $Config['repo'] `

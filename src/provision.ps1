@@ -217,7 +217,14 @@ function Get-AgentStatus {
     }
 
     # --- render ---
-    $issueRef = $State.issue_ref
+    $issueRef = 'issue-?'
+    if ($null -ne $State) {
+        if ($State -is [System.Collections.IDictionary]) {
+            if ($State.Contains('issue_ref')) { $issueRef = $State['issue_ref'] }
+        } elseif ($State.PSObject.Properties.Name -contains 'issue_ref') {
+            $issueRef = $State.issue_ref
+        }
+    }
     $mins = [math]::Round($ElapsedSeconds / 60, 1)
     $line = "[$issueRef] gate$gateProgress ($gateLabel) | todo $todoCount$todoText | ${mins}m"
     $autoDir = Join-Path $Workspace '.autonomad'
