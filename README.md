@@ -16,6 +16,9 @@ review.
 See [PLAN.md](PLAN.md) for the full v1 specification and [AGENTS.md](AGENTS.md) for the
 autonomy boundary + label state machine.
 
+> **New here?** Read **[RUNNING.md](RUNNING.md)** — requirements, setup, how to launch /
+> watch / stop Autonomad on any machine, and what happens to issues mid-processing.
+
 ## Directory layout (v1)
 
 ```

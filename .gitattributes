@@ -1,0 +1,5 @@
+# Shell scripts run inside the Linux sandbox container. Force LF so the
+# working-tree mount (used by A1 runtime agent registration, no image rebuild)
+# never ships CRLF shebangs or commands.
+*.sh text eol=lf
+Dockerfile text eol=lf

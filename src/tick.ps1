@@ -112,19 +112,23 @@ function Invoke-Gh {
 # ============================================================
 $script:Labels = @{
     'autonomous'     = 'Ready for the autonomous developer'
+    'ready-for-agent' = 'Ready for the autonomous developer (dual-label board)'
     'in-progress'    = 'Currently being developed by Autonomad'
     'pending-review' = 'PR opened; waiting for human review'
     'reviewing'      = 'Human reviewer is reviewing the PR'
     'approved'       = 'Human approved; ready to merge'
     'needs-human'    = 'Autonomad halted; requires human intervention'
+    'blocked'        = 'Blocked on an open dependency (Depends on / Blocked by #N)'
 }
 $script:LabelColors = @{
     'autonomous'     = '0E8A16'
+    'ready-for-agent' = '0E8A16'
     'in-progress'    = 'FB9C00'
     'pending-review' = '1D76DB'
     'reviewing'      = 'B60205'
     'approved'       = '5319E7'
     'needs-human'    = 'D93F0B'
+    'blocked'        = 'C5DEF5'
 }
 
 function Ensure-Labels {
@@ -158,6 +162,20 @@ function Set-IssueLabel {
     }
 }
 
+<#
+.SYNOPSIS
+  Normalize an issue's labels array to plain strings. Real gh returns label
+  objects; the mock returns plain strings. Both must compare the same.
+#>
+function Get-IssueLabelNames {
+    [CmdletBinding()]
+    param([object]$Issue)
+    # `,@()` keeps the result an array even when the issue has no labels.
+    return ,@($Issue.labels | ForEach-Object {
+        if ($_ -is [string]) { $_ } elseif ($_.name) { $_.name } else { "$_" }
+    })
+}
+
 function Add-IssueComment {
     param([int]$IssueNumber, [string]$Body)
     $bodyFile = Join-Path $script:DataDir "comment-$IssueNumber.md"
@@ -167,17 +185,192 @@ function Add-IssueComment {
 }
 
 # ============================================================
+# Live display sync (Phase 3 — AIOS pipeline-state pattern)
+# ============================================================
+<#
+.SYNOPSIS
+  Human-readable gate names for the issue-body checklist.
+#>
+$script:GateDisplayNames = @{
+    'branch_guard'   = 'Branch Guard'
+    'implementation' = 'Implementation'
+    'tester_gate'    = 'Tester Gate'
+    'review_gate'    = 'Review Gate'
+    'security_gate'  = 'Security Gate'
+    'verifier_gate'  = 'Verifier Gate'
+    'commit_push'    = 'Commit & Push'
+    'artifact_report' = 'Artifact Report'
+    'github_sync'    = 'GitHub Sync'
+    'human_approval' = 'Human Approval'
+}
+
+<#
+.SYNOPSIS
+  Rebuild the issue body's pipeline checklist so completed gates read - [x].
+  Idempotent: replaces any existing "### Pipeline" block with the current gate
+  states from pipeline-state.json (AIOS display-sync pattern).
+#>
+function Sync-IssueChecklist {
+    [CmdletBinding()]
+    param([int]$IssueNumber, [object]$State)
+    try {
+        $view = Invoke-Gh @('issue', 'view', "$IssueNumber", '--repo', $Config['repo'],
+            '--json', 'body') | ConvertFrom-Json
+    } catch {
+        Write-Log "Checklist sync: cannot read issue body: $($_.Exception.Message)" -Level 'WARN'
+        return
+    }
+    $body = [string]$view.body
+    # Keep everything above the current Pipeline block (if any), drop the rest.
+    $idx = $body.IndexOf('### Pipeline')
+    if ($idx -ge 0) { $body = $body.Substring(0, $idx).TrimEnd() }
+    # Build the checklist from the live gate states.
+    $lines = @('', '### Pipeline', '')
+    foreach ($g in $script:AllGates) {
+        $disp = $script:GateDisplayNames[$g]
+        $st = try { $State.gates.$g } catch { 'pending' }
+        $box = if ($st -eq 'completed') { 'x' } else { ' ' }
+        $lines += "- [$box] $disp"
+    }
+    $lines += ''
+    $newBody = ($body.TrimEnd() + ($lines -join "`n")).Trim()
+    # Preserve the original Pipeline header marker for idempotent re-sync.
+    if ($newBody -notmatch '### Pipeline') { $newBody = $body.TrimEnd() + "`n### Pipeline`n" + ($lines[2..($lines.Count - 1)] -join "`n") }
+    try {
+        $bodyFile = Join-Path $script:DataDir "checklist-$IssueNumber.md"
+        [System.IO.File]::WriteAllText($bodyFile, $newBody, (New-Object System.Text.UTF8Encoding($false)))
+        Invoke-Gh @('issue', 'edit', "$IssueNumber", '--repo', $Config['repo'], '--body-file', $bodyFile) | Out-Null
+        Remove-Item -LiteralPath $bodyFile -Force
+        Write-Log "Checklist synced for #$IssueNumber" -Level 'DEBUG'
+    } catch {
+        Write-Log "Checklist sync failed for #$IssueNumber : $($_.Exception.Message)" -Level 'WARN'
+    }
+}
+
+<#
+.SYNOPSIS
+  Append a structured gate comment (AIOS pipeline-state display pattern):
+    ## Gate: <name> — pass|fail|blocked
+#>
+function Add-GateComment {
+    [CmdletBinding()]
+    param(
+        [int]$IssueNumber,
+        [string]$Gate,
+        [string]$Status,      # pass | fail | blocked
+        [string]$Agent = 'autonomad-tick',
+        [hashtable]$Fields = @{},
+        [string]$Summary = ''
+    )
+    $lines = @(
+        "## Gate: $Gate — $Status",
+        '',
+        '| Field | Value |',
+        '|-------|-------|',
+        "| agent | $Agent |",
+        "| status | $Status |",
+        "| gate | $Gate |",
+        "| ts | $((Get-Date).ToUniversalTime().ToString('o')) |"
+    )
+    foreach ($k in $Fields.Keys) { $lines += "| $k | $($Fields[$k]) |" }
+    if ($Summary) {
+        $lines += '', '### Summary', $Summary
+    }
+    Add-IssueComment -IssueNumber $IssueNumber -Body ($lines -join "`n")
+}
+
+# ============================================================
 # Poll + claim
 # ============================================================
+<#
+.SYNOPSIS
+  Extract dependency issue references ("Depends on #N" / "Blocked by #N")
+  from an issue body. Returns an array of ints (deduped).
+#>
+function Get-DependencyRefs {
+    [CmdletBinding()]
+    param([string]$Body)
+    if ([string]::IsNullOrWhiteSpace($Body)) { return ,@() }
+    $refs = @()
+    foreach ($m in [regex]::Matches($Body, '(?i)(?:depends\s+on|blocked\s+by)\s+#(\d+)')) {
+        $refs += [int]$m.Groups[1].Value
+    }
+    # `,@()` keeps the result an array even when empty (a bare empty array is
+    # unrolled to $null on return, and .Count on $null throws under StrictMode).
+    return ,@($refs | Sort-Object -Unique)
+}
+
+<#
+.SYNOPSIS
+  Fetch the open/closed state of a single issue.
+#>
+function Get-IssueState {
+    [CmdletBinding()]
+    param([int]$IssueNumber)
+    try {
+        $view = Invoke-Gh @('issue', 'view', "$IssueNumber", '--repo', $Config['repo'],
+            '--json', 'state') | ConvertFrom-Json
+        return $view.state
+    } catch {
+        Write-Log "Cannot resolve dependency #$IssueNumber : $($_.Exception.Message)" -Level 'WARN'
+        return $null
+    }
+}
+
+<#
+.SYNOPSIS
+  Determine whether an issue is blocked by an open dependency. Manages the
+  `blocked` label: adds it when a dependency is open, removes it when none are.
+  Returns $true when blocked (a dependency is open).
+#>
+function Test-IssueBlocked {
+    [CmdletBinding()]
+    param([object]$Issue)
+    $deps = Get-DependencyRefs -Body $Issue.body
+    $labelNames = Get-IssueLabelNames -Issue $Issue
+    if ($deps.Count -eq 0) {
+        # No dependency declared — make sure a stale blocked label is dropped.
+        if ($labelNames -contains 'blocked') {
+            Set-IssueLabel -IssueNumber $Issue.number -Remove @('blocked')
+        }
+        return $false
+    }
+    foreach ($dep in $deps) {
+        $st = Get-IssueState -IssueNumber $dep
+        if ($st -eq 'OPEN') {
+            Set-IssueLabel -IssueNumber $Issue.number -Add @('blocked')
+            Write-Log "#$($Issue.number) blocked by open dependency #$dep" -Level 'DEBUG'
+            return $true
+        }
+    }
+    if ($labelNames -contains 'blocked') {
+        Set-IssueLabel -IssueNumber $Issue.number -Remove @('blocked')
+    }
+    return $false
+}
+
 function Get-CandidateIssue {
     [CmdletBinding()]
     param()
-    $json = Invoke-Gh @('issue', 'list', '--label', 'autonomous', '--assignee', 'none',
-        '--limit', '1', '--state', 'open', '--repo', $Config['repo'],
+    # NOTE: real gh (>=2.40) rejects `--assignee none` (treats it as a literal login).
+    # Use the search API so unassigned + labeled issues resolve correctly.
+    # Dual-label poll (B2): claim tickets that carry EITHER `ready-for-agent` OR
+    # `autonomous` (labels-as-board; both mean "pick me up next").
+    $json = Invoke-Gh @('issue', 'list', '--repo', $Config['repo'],
+        '--search', 'is:open no:assignee (label:"ready-for-agent" OR label:"autonomous")',
         '--json', 'number,title,url,body,labels,assignees')
-    $items = $json | ConvertFrom-Json
-    if (-not $items -or $items.Count -eq 0) { return $null }
-    return $items[0]
+    # @(...) so a single-row search result stays enumerable (ConvertFrom-Json
+    # collapses a one-element JSON array to a scalar).
+    $items = @($json | ConvertFrom-Json)
+    if ($items.Count -eq 0) { return $null }
+    # Dependency-aware selection: claim the LOWEST-numbered UNBLOCKED ticket.
+    $unblocked = @()
+    foreach ($item in @($items | Sort-Object { [int]$_.number })) {
+        if (Test-IssueBlocked -Issue $item) { continue }
+        $unblocked += $item
+    }
+    if ($unblocked.Count -eq 0) { return $null }
+    return $unblocked[0]
 }
 
 function Test-IssueClaimedByBot {
@@ -323,14 +516,10 @@ function Commit-PipelineState {
 
 function New-IssueSnapshot {
     param([object]$Issue)
-    # Real gh returns label objects; the mock returns plain strings.
-    $labelNames = @($Issue.labels | ForEach-Object {
-        if ($_ -is [string]) { $_ } elseif ($_.name) { $_.name } else { "$_" }
-    })
     return @{
         title  = $Issue.title
         body   = $Issue.body
-        labels = $labelNames
+        labels = Get-IssueLabelNames -Issue $Issue
         url    = $Issue.url
     }
 }
@@ -487,6 +676,12 @@ function Close-OutIssue {
     & (Join-Path $PSScriptRoot 'report.ps1') -State $State -ReportsDir $script:ReportsDir -LogsDir $script:ReportsDir -Issue $Issue
     if ($LASTEXITCODE -ne 0) { Write-Log "report.ps1 failed (exit $LASTEXITCODE)" -Level 'WARN' }
 
+    # Phase 4 — finalizer close-out: close remaining checklist items + notify comment.
+    Sync-IssueChecklist -IssueNumber $State.issue_number -State $State
+    Add-GateComment -IssueNumber $State.issue_number -Gate 'github_sync' -Status 'pass' `
+        -Fields @{ 'pr_url' = $prUrl; 'report' = "reports/$issueRef.html"; 'branch' = $branch } `
+        -Summary "Autonomad v1.5 finished #$($State.issue_number). PR opened; checklist completed; pending human review."
+
     return $State
 }
 
@@ -508,7 +703,10 @@ function Halt-Issue {
     }
     try {
         Set-IssueLabel -IssueNumber $State.issue_number -Add @('needs-human') -Remove @('in-progress', 'autonomous')
-        Add-IssueComment -IssueNumber $State.issue_number -Body "Autonomad halted and needs a human. Reason: $Reason"
+        # Structured gate comment (display-sync pattern) replaces the ad-hoc line.
+        Add-GateComment -IssueNumber $State.issue_number -Gate ($State.current_step ?? 'halt') `
+            -Status 'blocked' -Summary "Autonomad halted and needs a human. Reason: $Reason"
+        Sync-IssueChecklist -IssueNumber $State.issue_number -State $State
     } catch {
         Write-Log "Halt label/comment failed: $($_.Exception.Message)" -Level 'WARN'
     }
@@ -620,6 +818,23 @@ function Process-Issue {
     $result = Invoke-Sandbox -Config $Config -State $state -Workspace $workspace -Prompt $prompt `
         -DataDir $script:DataDir -EnvFile $EnvFile -BrainRoot $script:BrainRoot
 
+    # --- watchdog kill: count as a failed attempt (retry or hard stop) ---
+    if ($result.PSObject.Properties.Name -contains 'killed' -and $result.killed) {
+        $state.attempts = [int]$state.attempts + 1
+        $state.last_error = "sandbox watchdog killed run: $($result.kill_reason)"
+        $state.updated_at = (Get-Date).ToUniversalTime().ToString('o')
+        $statePath = Join-Path $workspace 'pipeline-state.json'
+        Write-PipelineState -Path $statePath -State $state | Out-Null
+        Commit-PipelineState -Workspace $workspace -State $state -Message "attempt $($state.attempts) watchdog-killed"
+        Write-Log "Watchdog killed sandbox for #$issueNum (attempt $($state.attempts)/$($Config['max_retries'])): $($result.kill_reason)"
+        if ($state.attempts -ge [int]$Config['max_retries']) {
+            Halt-Issue -State $state -Issue $Issue -Reason "N=$($Config['max_retries']) attempts (incl. watchdog kills): $($result.kill_reason)"
+        } else {
+            Write-Log "Retrying #$issueNum (attempt $($state.attempts))"
+        }
+        return
+    }
+
     # --- read back the dev agent's state (FAILS CLOSED) ---
     $statePath = Join-Path $workspace 'pipeline-state.json'
     try {
@@ -635,6 +850,9 @@ function Process-Issue {
     }
     $agentResult = Read-ResultJson -Workspace $workspace
     $outcome = if ($agentResult -and $agentResult.outcome) { $agentResult.outcome } else { $newState.status }
+
+    # --- live display sync (Phase 3): mirror dev-agent gate progress on the issue ---
+    Sync-IssueChecklist -IssueNumber $issueNum -State $newState
 
     # --- halt triggers (T7) ---
     $confidence = if ($agentResult -and $null -ne $agentResult.confidence) { [double]$agentResult.confidence } else { 1.0 }
@@ -713,6 +931,83 @@ Write-Log "Autonomad tick starting (repo=$($Config['repo']), harness=$($Config['
 Write-Log "Brain root: $(if ($script:BrainRoot) { $script:BrainRoot } else { '<unset>' })"
 Write-Log "Sandbox mode: $([System.Environment]::GetEnvironmentVariable('AUTONOMAD_SANDBOX_MODE') ?? 'docker')"
 
+# ============================================================
+# Orphan reconciliation (stranded-claim safety)
+# ============================================================
+<#
+.SYNOPSIS
+  Release any issue that carries the bot's `in-progress` claim but has NO live
+  workspace (e.g. the previous tick was killed mid-run / before workspace init).
+  Returns them to the `autonomous` pool so nothing strands forever.
+#>
+function Release-OrphanedClaims {
+    [CmdletBinding()]
+    param()
+    try {
+        # All open issues assigned to the bot.
+        $json = Invoke-Gh @('issue', 'list', '--repo', $Config['repo'],
+            '--search', "is:open assignee:$($Config['bot_login'])",
+            '--json', 'number,title,labels,assignees')
+        $issues = @($json | ConvertFrom-Json)
+    } catch {
+        Write-Log "Orphan scan failed: $($_.Exception.Message)" -Level 'WARN'
+        return
+    }
+    foreach ($iss in $issues) {
+        $labelNames = Get-IssueLabelNames -Issue $iss
+        # Only care about issues still in the work-in-progress state.
+        if ($labelNames -notcontains 'in-progress') { continue }
+        $workspace = Join-Path $script:WorkspacesDir "issue-$($iss.number)"
+        $statePath = Join-Path $workspace 'pipeline-state.json'
+        if (Test-Path -LiteralPath $statePath) {
+            # Live workspace -> owned by an active or resumable run. Leave it.
+            Write-Log "Orphan scan: #$($iss.number) has a live workspace — skipping" -Level 'DEBUG'
+            continue
+        }
+        Write-Log "RELEASE orphaned claim #$($iss.number) (no workspace — previous run was interrupted)"
+        try {
+            Invoke-Gh @('issue', 'edit', "$($iss.number)", '--repo', $Config['repo'],
+                '--remove-assignee', $Config['bot_login'],
+                '--remove-label', 'in-progress',
+                '--add-label', 'autonomous') | Out-Null
+        } catch {
+            Write-Log "Release orphan #$($iss.number) failed: $($_.Exception.Message)" -Level 'WARN'
+        }
+    }
+}
+
+<#
+.SYNOPSIS
+  Clean up orphaned sandbox containers left by a killed tick (name prefix
+  autonomad-sandbox-*). Safe: only removes autonomad's own containers.
+#>
+function Cleanup-OrphanedSandboxes {
+    [CmdletBinding()]
+    param()
+    try {
+        $ids = & docker ps -a --filter "name=autonomad-sandbox-" --format '{{.ID}} {{.Names}}' 2>$null
+        if ($LASTEXITCODE -ne 0) { return }
+        foreach ($line in @($ids)) {
+            if ([string]::IsNullOrWhiteSpace($line)) { continue }
+            $id = ($line -split '\s+')[0]
+            Write-Log "Removing orphaned sandbox container $id"
+            & docker rm -f $id 2>&1 | Out-Null
+        }
+    } catch {
+        Write-Log "Sandbox cleanup failed: $($_.Exception.Message)" -Level 'WARN'
+    }
+}
+
+# ============================================================
+# Graceful shutdown (release claims on Ctrl+C / SIGTERM)
+# ============================================================
+$script:ShutdownRequested = $false
+# PowerShell-native signal handling: Ctrl+C / SIGTERM set the flag so the loop
+# exits cleanly and Release-OrphanedClaims fires before exit.
+$null = Register-ObjectEvent -InputObject ([System.Console]) -EventName CancelKeyPress -Action {
+    $script:ShutdownRequested = $true
+}
+
 # Init: idempotent labels
 Ensure-Labels
 # Wire git auth (m12): GIT_ASKPASS supplies the bot token at prompt time instead
@@ -720,12 +1015,23 @@ Ensure-Labels
 $script:AskPassPath = Write-GitAskPass
 Write-Heartbeat
 
+# Startup reconciliation: reclaim anything the previous (possibly killed) run left.
+Release-OrphanedClaims
+Cleanup-OrphanedSandboxes
+
 $tickCount = 0
 $lastWorkAt = (Get-Date).ToUniversalTime()
 
 while ($true) {
     $tickCount++
     Write-Heartbeat
+
+    if ($script:ShutdownRequested) {
+        Write-Log "Shutdown requested — releasing claims and exiting."
+        Release-OrphanedClaims
+        Cleanup-OrphanedSandboxes
+        exit 0
+    }
 
     if ($MaxTicks -gt 0 -and $tickCount -gt $MaxTicks) {
         Write-Log "MaxTicks ($MaxTicks) reached — exiting."

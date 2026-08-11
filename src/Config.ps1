@@ -17,7 +17,8 @@ $ErrorActionPreference = 'Stop'
 $script:ConfigKeys = @(
     'repo', 'harness', 'model', 'test_command', 'build_command',
     'poll_interval', 'idle_timeout', 'ttl', 'max_retries', 'bot_login',
-    'branch_prefix', 'base_branch', 'brain_paths'
+    'branch_prefix', 'base_branch', 'brain_paths',
+    'sandbox_timeout', 'progress_threshold', 'watch_poll', 'stall_kill'
 )
 
 <#
@@ -73,7 +74,7 @@ function Read-RepoConfig {
     if (-not ($cfg['repo'] -match '^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$')) {
         $errors += "repo must be owner/name (got '$($cfg['repo'])')"
     }
-    foreach ($intKey in @('poll_interval', 'idle_timeout', 'ttl', 'max_retries')) {
+    foreach ($intKey in @('poll_interval', 'idle_timeout', 'ttl', 'max_retries', 'sandbox_timeout', 'progress_threshold', 'watch_poll', 'stall_kill')) {
         if ($cfg.Contains($intKey) -and -not ($cfg[$intKey] -match '^\d+$')) {
             $errors += "$intKey must be a positive integer (got '$($cfg[$intKey])')"
         }
@@ -98,13 +99,17 @@ function Read-RepoConfig {
 
     # Defaults for optional keys.
     $defaults = @{
-        poll_interval = '60'
-        idle_timeout  = '1800'
-        ttl           = '3600'
-        max_retries   = '2'
-        bot_login     = 'autonomad-bot'
-        branch_prefix = 'autonomad'
-        base_branch   = 'main'
+        poll_interval     = '60'
+        idle_timeout      = '1800'
+        ttl               = '3600'
+        max_retries       = '2'
+        bot_login         = 'autonomad-bot'
+        branch_prefix     = 'autonomad'
+        base_branch       = 'main'
+        sandbox_timeout   = '1800'
+        progress_threshold = '60'
+        watch_poll        = '15'
+        stall_kill        = '900'
     }
     foreach ($k in $defaults.Keys) {
         if (-not $cfg.Contains($k) -or [string]::IsNullOrWhiteSpace($cfg[$k])) {

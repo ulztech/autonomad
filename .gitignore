@@ -11,6 +11,8 @@ learning.db-*
 *.db-shm
 *.db-wal
 last_tick.ts
+.git-askpass.cmd
+.git-askpass.sh
 
 # Generated artifacts
 reports/*.html

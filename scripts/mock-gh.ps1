@@ -132,6 +132,12 @@ switch ($cmd) {
                         Add-Event 'issue_label_add' @{ issue = $num; label = $l }
                     }
                 }
+                # --body-file (checklist sync reads/writes the issue body)
+                $bodyFile = Get-FlagValue $rest '--body-file'
+                if ($bodyFile -and (Test-Path -LiteralPath $bodyFile)) {
+                    $iss.body = (Get-Content -LiteralPath $bodyFile -Raw).TrimEnd("`r", "`n")
+                    Add-Event 'issue_body_update' @{ issue = $num }
+                }
                 Save-State $state
                 Write-Output "edited issue #$num"
             }

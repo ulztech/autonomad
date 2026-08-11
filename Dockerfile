@@ -55,7 +55,20 @@ RUN curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg | d
 # --- opencode (dev harness; repo.config harness decides which is invoked) ---
 # Pinned (m9): unpinned @latest made image builds non-reproducible and could
 # silently break the harness contract. 1.18.16 matches the installed CLI.
-RUN npm install -g opencode-ai@1.18.16
+# After install, purge the npm cache (330MB of pure build-time waste) and drop
+# the unused CPU-baseline opencode variant (176MB). The host CPU has AVX2/SSE4.2,
+# so only the fast `opencode-linux-x64` binary ever loads.
+RUN npm install -g opencode-ai@1.18.16 \
+    && rm -rf /root/.npm \
+    && rm -rf /usr/local/lib/node_modules/opencode-ai/node_modules/opencode-linux-x64-baseline
+
+# --- Slim: docker daemon stack is never used inside the container ---
+# The container talks to the HOST docker daemon through /var/run/docker.sock
+# (mounted by Start-Autonomad.ps1) — it only needs the `docker` CLI, never
+# dockerd/containerd/runc/shims. Remove the ~156MB daemon stack.
+RUN rm -f /usr/sbin/dockerd /usr/bin/containerd /usr/sbin/runc \
+        /usr/bin/containerd-shim /usr/bin/containerd-shim-runc-v1 /usr/bin/containerd-shim-runc-v2 \
+    && rm -f /usr/bin/ctr /usr/bin/dnet
 
 # --- Autonomad payload ---
 WORKDIR $AUTONOMAD_HOME
