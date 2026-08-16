@@ -73,3 +73,24 @@ autonomad/
 - `pwsh -File scripts/DryRun-Autonomad.ps1` runs the full claim → develop → close-out →
   harvest path **without docker / GitHub / LLM** (mock gh + mock dev agent) and asserts the
   autonomy boundary (no merge, no `approved`, `needs-human` paths work).
+
+## Scripts
+
+- `src/monitor.ps1` — live monitoring dashboard (read-only): `pwsh -File src/monitor.ps1 -DataDir C:\GitRepos\autonomad-data` serves http://127.0.0.1:8686 (5s auto-refresh); add `-Once` for a static snapshot. Shows Autonomad Health (supervisor/tick/docker/gh), Auto-Heal events from `reconciliation.log`, and the claim queue.
+- `src/supervisor.ps1` — always-on watcher (issue #19), runs as a separate hidden process. Watches Docker (hysteresis: 3 failed checks = down), spawns/restarts the tick loop with a restart cap (5 per 10 min), and schedules the gated claim reconciliation every `reconcile_interval` (60s). Writes `supervisor-state.json` in DataDir every cycle. Start: `pwsh -NoProfile -WindowStyle Hidden -File src/supervisor.ps1 -DataDir C:\GitRepos\autonomad-data`. The `/autonomad` skill auto-starts it after triggering.
+- `src/tick.ps1` — the tick loop. New in issue #19: `-ReconcileOnce` runs the gated self-heal pass and exits (the supervisor's scheduler calls this); `-ReconcileDryRun` logs intended actions without mutating anything. With `reconcile_stale = true` (default), a TTL-stale but still-owned claim is reset-and-resumed instead of halted — `max_retries` still escalates to `needs-human` when the work truly cannot complete.
+
+### Claim reconciliation (self-heal, issue #19)
+
+Gated trigger — runs only when BOTH:
+1. **Quiet** — no live tick process, no autonomad sandbox containers, no workspace touched within `activity_window` (300s).
+2. **Attention** — a stale claim (> `ttl`), a `needs-human` claim, or a delivered-but-open orphan (PR open while workspace says in-progress).
+
+Actions (own claims only — never closes issues, never merges PRs):
+- `resume` — stale-but-owned claim: reset staleness so the next poll resumes it.
+- `release` — bot no longer holds (unassigned or `in-progress` label removed): release the local claim + unassign bot.
+- `mark-pending-review` — PR open but workspace in-progress: sync status + PR URL.
+- `close-out` — issue closed: record outcome (merged or not) + hygiene labels.
+- `resolve-halt` — `needs-human` ticket that is now closed: mark resolved.
+
+Every action is appended to `autonomad-data\reconciliation.log` (JSONL) and surfaced in the monitor's Auto-Heal panel. Config: `reconcile_stale` (default true), `activity_window` (300), `reconcile_interval` (60), `reconcile_max_retries` (3).

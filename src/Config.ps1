@@ -75,10 +75,15 @@ function Read-RepoConfig {
     if (-not ($cfg['repo'] -match '^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$')) {
         $errors += "repo must be owner/name (got '$($cfg['repo'])')"
     }
-    foreach ($intKey in @('poll_interval', 'idle_timeout', 'ttl', 'max_retries', 'sandbox_timeout', 'progress_threshold', 'watch_poll', 'stall_kill')) {
+    foreach ($intKey in @('poll_interval', 'idle_timeout', 'ttl', 'max_retries', 'sandbox_timeout', 'progress_threshold', 'watch_poll', 'stall_kill',
+            'activity_window', 'reconcile_interval', 'reconcile_max_retries')) {
         if ($cfg.Contains($intKey) -and -not ($cfg[$intKey] -match '^\d+$')) {
             $errors += "$intKey must be a positive integer (got '$($cfg[$intKey])')"
         }
+    }
+    # reconcile_stale: optional bool flag (true/false/1/0/yes/no).
+    if ($cfg.Contains('reconcile_stale') -and $cfg['reconcile_stale'] -notmatch '^(true|false|1|0|yes|no)$') {
+        $errors += "reconcile_stale must be a boolean (true|false|1|0|yes|no) (got '$($cfg['reconcile_stale'])')"
     }
     # model: optional override; must be a non-empty string when present.
     if ($cfg.Contains('model') -and [string]::IsNullOrWhiteSpace($cfg['model'])) {
@@ -117,6 +122,10 @@ function Read-RepoConfig {
         progress_threshold = '60'
         watch_poll        = '15'
         stall_kill        = '900'
+        reconcile_stale   = 'true'
+        activity_window   = '300'
+        reconcile_interval = '60'
+        reconcile_max_retries = '3'
     }
     foreach ($k in $defaults.Keys) {
         if (-not $cfg.Contains($k) -or [string]::IsNullOrWhiteSpace($cfg[$k])) {

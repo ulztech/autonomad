@@ -13,7 +13,7 @@
 #   7. Halt (confidence<90 / escalation / fatal flaw / N=max_retries): needs-human
 #
 # Usage:
-#   pwsh -File src/tick.ps1 [-Once] [-ConfigPath x] [-DataDir y] [-GhBin z] [-MaxTicks n]
+#   pwsh -File src/tick.ps1 [-Once] [-ReconcileOnce [-ReconcileDryRun]] [-ConfigPath x] [-DataDir y] [-GhBin z] [-MaxTicks n]
 #
 # Env overrides:
 #   GH_BIN                gh executable (tests inject a mock)
@@ -22,6 +22,8 @@
 [CmdletBinding()]
 param(
     [switch]$Once,
+    [switch]$ReconcileOnce,
+    [switch]$ReconcileDryRun,
     [string]$ConfigPath = '',
     [string]$DataDir = '',
     [string]$GhBin = '',
@@ -153,12 +155,13 @@ function Ensure-Labels {
 }
 
 function Set-IssueLabel {
-    param([int]$IssueNumber, [string[]]$Add, [string[]]$Remove)
+    param([int]$IssueNumber, [string[]]$Add, [string[]]$Remove, [string]$Repo = '')
+    if ([string]::IsNullOrWhiteSpace($Repo)) { $Repo = $Config['repo'] }
     if ($Add.Count -gt 0) {
-        Invoke-Gh @('issue', 'edit', "$IssueNumber", '--repo', $Config['repo'], '--add-label', ($Add -join ',')) | Out-Null
+        Invoke-Gh @('issue', 'edit', "$IssueNumber", '--repo', $Repo, '--add-label', ($Add -join ',')) | Out-Null
     }
     if ($Remove.Count -gt 0) {
-        Invoke-Gh @('issue', 'edit', "$IssueNumber", '--repo', $Config['repo'], '--remove-label', ($Remove -join ',')) | Out-Null
+        Invoke-Gh @('issue', 'edit', "$IssueNumber", '--repo', $Repo, '--remove-label', ($Remove -join ',')) | Out-Null
     }
 }
 
@@ -945,20 +948,36 @@ function Find-ResumableIssue {
                 continue
             }
             if ($age -gt $ttlSeconds) {
-                Write-Log "TTL-stale $($dir.Name) ($([math]::Round($age))s > ${ttlSeconds}s) — halting with needs-human" -Level 'WARN'
-                try {
-                    Halt-Issue -State $state -Reason "TTL-stale: in-progress for $([math]::Round($age))s (ttl=${ttlSeconds}s); Autonomad halted the stranded claim"
-                } catch {
-                    Write-Log "TTL-stale halt failed for $($dir.Name): $($_.Exception.Message)" -Level 'ERROR'
+                if (ConvertTo-Bool $Config['reconcile_stale']) {
+                    # Self-heal path (reconcile_stale on, default): the claim is stale but
+                    # still owned by the bot. Reset its clock so the next poll resumes it
+                    # instead of stranding it forever. attempts/max_retries still escalate
+                    # to a real halt inside Process-Issue when the work cannot complete.
+                    Write-Log "TTL-stale $($dir.Name) ($([math]::Round($age))s > ${ttlSeconds}s) — resetting staleness for resume (reconcile_stale on)" -Level 'WARN'
+                    $state.updated_at = (Get-Date).ToUniversalTime().ToString('o')
+                    Write-PipelineState -Path $statePath -State $state | Out-Null
+                } else {
+                    Write-Log "TTL-stale $($dir.Name) ($([math]::Round($age))s > ${ttlSeconds}s) — halting with needs-human" -Level 'WARN'
+                    try {
+                        Halt-Issue -State $state -Reason "TTL-stale: in-progress for $([math]::Round($age))s (ttl=${ttlSeconds}s); Autonomad halted the stranded claim"
+                    } catch {
+                        Write-Log "TTL-stale halt failed for $($dir.Name): $($_.Exception.Message)" -Level 'ERROR'
+                    }
                 }
                 continue
             }
-            # Confirm the issue is still open + assigned to bot
+            # Confirm the issue is still open + still HELD by the bot (assigned AND
+            # in-progress label present). A human may have released the claim by
+            # removing in-progress / adding ready-for-agent even while the bot is
+            # still assigned — resuming it would override that decision. Released
+            # claims are reconciled locally by the self-heal pass instead.
             try {
                 $view = Invoke-Gh @('issue', 'view', "$($state.issue_number)", '--repo', $Config['repo'],
                     '--json', 'state,assignees,labels') | ConvertFrom-Json
                 if ($view.state -ne 'OPEN') { Write-Log "Skipping $($dir.Name): issue not open"; continue }
+                $labelNames = Get-IssueLabelNames -Issue $view
                 if (-not (Test-IssueClaimedByBot -Issue $view)) { Write-Log "Skipping $($dir.Name): not assigned to bot"; continue }
+                if ($labelNames -notcontains 'in-progress') { Write-Log "Skipping $($dir.Name): claim released (in-progress label removed)"; continue }
             } catch {
                 Write-Log "Skipping $($dir.Name): cannot verify issue state: $($_.Exception.Message)" -Level 'WARN'
                 continue
@@ -1126,6 +1145,18 @@ function Write-Heartbeat {
     [System.IO.File]::WriteAllText($script:HeartbeatFile, (Get-Date).ToUniversalTime().ToString('o'), (New-Object System.Text.UTF8Encoding($false)))
 }
 
+<#
+.SYNOPSIS
+  Parse a repo.config boolean flag (true/false/1/0/yes/no). Returns $true by
+  default so an unset key keeps self-healing enabled.
+#>
+function ConvertTo-Bool {
+    param([string]$Value)
+    if ($Value -match '^(true|1|yes)$') { return $true }
+    if ($Value -match '^(false|0|no)$') { return $false }
+    return $true
+}
+
 function Test-IdleTimeout {
     param([datetime]$LastWorkAt)
     if (-not $LastWorkAt) { return $false }
@@ -1208,6 +1239,305 @@ function Cleanup-OrphanedSandboxes {
 }
 
 # ============================================================
+# Gated claim reconciliation (self-heal, issue #19)
+# ============================================================
+# Runs ONLY when Autonomad is QUIET (no live tick, no sandbox, nothing touched
+# within activity_window) AND an ATTENTION condition exists (stale claim,
+# needs-human, delivered-but-open orphan). Own claims only: it never touches a
+# claim that is not recorded in a local workspace, never closes issues, and
+# never merges PRs. Every action is appended to reconciliation.log (JSONL).
+$script:ReconcileLog = Join-Path $script:DataDir 'reconciliation.log'
+
+function Write-ReconcileLog {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$Action,
+        [Parameter(Mandatory = $true)][string]$Issue,
+        [string]$Reason = '',
+        [switch]$DryRun
+    )
+    $rec = [ordered]@{
+        ts       = (Get-Date).ToUniversalTime().ToString('o')
+        action   = $Action
+        issue    = $Issue
+        reason   = $Reason
+        dry_run  = [bool]$DryRun
+    }
+    $line = $rec | ConvertTo-Json -Compress
+    Add-Content -LiteralPath $script:ReconcileLog -Value $line -Encoding utf8
+    Write-Log "RECONCILE [$Action] issue=$Issue $(if ($DryRun) { '(dry-run)' } else { '' })$Reason" -Level 'INFO'
+}
+
+<#
+.SYNOPSIS
+  True when Autonomad is not actively doing anything: no other tick process,
+  no autonomad sandbox container, no workspace touched within activity_window.
+#>
+function Test-AutonomadQuiet {
+    [CmdletBinding()]
+    param()
+    $reasons = [System.Collections.Generic.List[string]]::new()
+    $window = [int]$Config['activity_window']
+
+    # 1) Another tick process running. Exclude THIS process and every ancestor
+    #    (a shell that launched us may carry 'tick.ps1' in its own command line).
+    $skip = [System.Collections.Generic.HashSet[int]]::new()
+    $null = $skip.Add([int]$PID)
+    $cur = $PID
+    try {
+        for ($i = 0; $i -lt 8; $i++) {
+            $me = Get-CimInstance Win32_Process -Filter "ProcessId=$cur" -ErrorAction SilentlyContinue
+            if ($null -eq $me -or $null -eq $me.ParentProcessId -or [int]$me.ParentProcessId -le 0) { break }
+            $cur = [int]$me.ParentProcessId
+            if ($skip.Contains($cur)) { break }
+            $null = $skip.Add($cur)
+        }
+    } catch { }
+    try {
+        $procs = Get-CimInstance Win32_Process -Filter "Name='pwsh.exe' OR Name='powershell.exe'" -ErrorAction SilentlyContinue
+        foreach ($p in $procs) {
+            $pidN = [int]$p.ProcessId
+            if ($skip.Contains($pidN)) { continue }
+            if ($p.CommandLine -and $p.CommandLine -match 'tick\.ps1') {
+                $reasons.Add("live tick pid $pidN")
+                break
+            }
+        }
+    } catch { }
+
+    # 2) Autonomad sandbox containers.
+    try {
+        $ids = & docker ps --filter "name=autonomad-sandbox-" --format '{{.ID}}' 2>$null
+        if ($LASTEXITCODE -eq 0) {
+            foreach ($l in @($ids)) {
+                if (-not [string]::IsNullOrWhiteSpace($l)) { $reasons.Add("sandbox container $l"); break }
+            }
+        }
+    } catch { }
+
+    # 3) Workspaces touched within activity_window.
+    if (Test-Path -LiteralPath $script:WorkspacesDir) {
+        $cutoff = (Get-Date).ToUniversalTime().AddSeconds(-$window)
+        foreach ($d in (Get-ChildItem -LiteralPath $script:WorkspacesDir -Directory -ErrorAction SilentlyContinue)) {
+            $sp = Join-Path $d.FullName 'pipeline-state.json'
+            if (-not (Test-Path -LiteralPath $sp)) { continue }
+            try {
+                if ((Get-Item -LiteralPath $sp).LastWriteTimeUtc -gt $cutoff) {
+                    $reasons.Add("workspace $($d.Name) touched recently")
+                    break
+                }
+            } catch { }
+        }
+    }
+
+    return [pscustomobject]@{ quiet = ($reasons.Count -eq 0); reasons = @($reasons) }
+}
+
+<#
+.SYNOPSIS
+  True when any local workspace needs attention: needs-human, or a
+  claimed/in-progress workspace older than ttl. Delivered-but-open orphans are
+  additionally detected per-claim inside Invoke-ReconcileClaims (needs GH).
+#>
+function Test-AttentionNeeded {
+    [CmdletBinding()]
+    param()
+    $reasons = [System.Collections.Generic.List[string]]::new()
+    $ttlSeconds = [int]$Config['ttl']
+    if (-not (Test-Path -LiteralPath $script:WorkspacesDir)) {
+        return [pscustomobject]@{ attention = $false; reasons = @() }
+    }
+    foreach ($d in (Get-ChildItem -LiteralPath $script:WorkspacesDir -Directory -ErrorAction SilentlyContinue)) {
+        $sp = Join-Path $d.FullName 'pipeline-state.json'
+        if (-not (Test-Path -LiteralPath $sp)) { continue }
+        try {
+            $state = Read-PipelineState -Path $sp -SchemaPath $script:SchemaPath
+        } catch { continue }
+        if ($state.status -eq 'needs-human') {
+            $reasons.Add("$($d.Name): needs-human")
+            continue
+        }
+        if ($state.status -in @('claimed', 'in_progress')) {
+            try {
+                $age = ((Get-Date).ToUniversalTime() - [datetime]::Parse($state.updated_at)).TotalSeconds
+            } catch { continue }
+            if ($age -gt $ttlSeconds) {
+                $reasons.Add("$($d.Name): stale $([math]::Round($age))s")
+            }
+        }
+    }
+    return [pscustomobject]@{ attention = ($reasons.Count -gt 0); reasons = @($reasons) }
+}
+
+<#
+.SYNOPSIS
+  Fetch the PR (any state) for a head branch, so reconciliation can detect a
+  merged PR even after it is closed. Returns the PR object or $null.
+#>
+function Get-PrRecord {
+    [CmdletBinding()]
+    param([string]$Branch, [string]$Repo = '')
+    if ([string]::IsNullOrWhiteSpace($Branch)) { return $null }
+    if ([string]::IsNullOrWhiteSpace($Repo)) { $Repo = $Config['repo'] }
+    try {
+        $json = Invoke-Gh @('pr', 'list', '--repo', $Repo, '--head', $Branch,
+            '--state', 'all', '--json', 'number,url,state,mergedAt')
+        $items = @($json | ConvertFrom-Json)
+        if ($items.Count -eq 0) { return $null }
+        return $items[0]
+    } catch {
+        Write-Log "Reconcile: cannot list PRs for ${Branch}: $($_.Exception.Message)" -Level 'WARN'
+        return $null
+    }
+}
+
+<#
+.SYNOPSIS
+  The reconciliation pass. Iterates local workspaces, compares each against
+  GitHub truth, and repairs only claims Autonomad itself owns. -DryRun logs
+  the intended actions without mutating anything (state files or GitHub).
+#>
+function Invoke-ReconcileClaims {
+    [CmdletBinding()]
+    param([switch]$DryRun)
+
+    $actions = [System.Collections.Generic.List[object]]::new()
+    if (-not (ConvertTo-Bool $Config['reconcile_stale'])) {
+        Write-Log 'Reconcile: reconcile_stale=false — pass skipped' -Level 'INFO'
+        return @($actions)
+    }
+    if (-not (Test-Path -LiteralPath $script:WorkspacesDir)) {
+        Write-Log 'Reconcile: no workspaces dir — nothing to reconcile' -Level 'INFO'
+        return @($actions)
+    }
+
+    foreach ($d in (Get-ChildItem -LiteralPath $script:WorkspacesDir -Directory | Sort-Object Name)) {
+        $sp = Join-Path $d.FullName 'pipeline-state.json'
+        if (-not (Test-Path -LiteralPath $sp)) { continue }
+        try {
+            $state = Read-PipelineState -Path $sp -SchemaPath $script:SchemaPath
+        } catch {
+            Write-ReconcileLog -Action 'warn' -Issue $d.Name -Reason "unreadable state: $($_.Exception.Message)" -DryRun:$DryRun
+            continue
+        }
+        try { $issueNum = [int]$state.issue_number } catch { continue }
+        if ($issueNum -le 0) { continue }
+        $branch = [string]$state.branch
+        # Workspaces record their own target repo (a run may have overridden
+        # repo.config, e.g. a HRSystem-Legacy targeted run). Fall back to config.
+        $repo = [string]$state.repo
+        if ([string]::IsNullOrWhiteSpace($repo)) { $repo = $Config['repo'] }
+
+        # GitHub truth for this claim.
+        try {
+            $view = Invoke-Gh @('issue', 'view', "$issueNum", '--repo', $repo,
+                '--json', 'state,assignees,labels') | ConvertFrom-Json
+        } catch {
+            Write-ReconcileLog -Action 'warn' -Issue $d.Name -Reason "gh view failed: $($_.Exception.Message)" -DryRun:$DryRun
+            continue
+        }
+        $labelNames = Get-IssueLabelNames -Issue $view
+        $assignedToBot = Test-IssueClaimedByBot -Issue $view
+        $held = $assignedToBot -and ($labelNames -contains 'in-progress')
+        $pr = Get-PrRecord -Branch $branch -Repo $repo
+        $prMerged = ($null -ne $pr -and -not [string]::IsNullOrWhiteSpace([string]$pr.mergedAt))
+
+        # 1) needs-human: leave for the human while the ticket is open; auto-resolve
+        #    when the ticket is closed (the halt reason is moot).
+        if ($state.status -eq 'needs-human' -or $labelNames -contains 'needs-human') {
+            if ($view.state -ne 'OPEN') {
+                $actions.Add([pscustomobject]@{ action = 'resolve-halt'; issue = $issueNum; workspace = $d.Name; reason = "ticket closed while needs-human (merged=$prMerged)" })
+                Write-ReconcileLog -Action 'resolve-halt' -Issue $d.Name -Reason "ticket closed while needs-human (merged=$prMerged)" -DryRun:$DryRun
+                if (-not $DryRun) {
+                    $state.status = 'resolved'
+                    $state.reconcile_note = 'needs-human ticket closed; auto-resolved'
+                    $state.updated_at = (Get-Date).ToUniversalTime().ToString('o')
+                    Write-PipelineState -Path $sp -State $state | Out-Null
+                    try { Set-IssueLabel -IssueNumber $issueNum -Repo $repo -Remove @('needs-human', 'in-progress') } catch {
+                        Write-Log "Reconcile: resolve-halt label cleanup failed for #$issueNum : $($_.Exception.Message)" -Level 'WARN'
+                    }
+                }
+            } else {
+                Write-Log "Reconcile: $($d.Name) needs-human (open) — leaving for human" -Level 'DEBUG'
+            }
+            continue
+        }
+
+        # 2) Issue closed -> close-out (record outcome; hygiene labels only).
+        if ($view.state -ne 'OPEN') {
+            $actions.Add([pscustomobject]@{ action = 'close-out'; issue = $issueNum; workspace = $d.Name; reason = "issue closed (merged=$prMerged)" })
+            Write-ReconcileLog -Action 'close-out' -Issue $d.Name -Reason "issue closed (merged=$prMerged)" -DryRun:$DryRun
+            if (-not $DryRun) {
+                $state.status = 'closed-out'
+                $state.reconcile_note = "issue closed; merged=$prMerged"
+                $state.updated_at = (Get-Date).ToUniversalTime().ToString('o')
+                Write-PipelineState -Path $sp -State $state | Out-Null
+                try { Set-IssueLabel -IssueNumber $issueNum -Repo $repo -Remove @('in-progress', 'needs-human', 'autonomous', 'ready-for-agent') } catch {
+                    Write-Log "Reconcile: close-out label cleanup failed for #$issueNum : $($_.Exception.Message)" -Level 'WARN'
+                }
+            }
+            continue
+        }
+
+        # 3) Bot no longer holds the claim (unassigned or in-progress removed by a
+        #    human) -> release the local claim so a fresh poll can re-claim it.
+        if (-not $held) {
+            $actions.Add([pscustomobject]@{ action = 'release'; issue = $issueNum; workspace = $d.Name; reason = 'bot no longer holds the claim' })
+            Write-ReconcileLog -Action 'release' -Issue $d.Name -Reason "bot no longer holds (assigned=$assignedToBot, in-progress=$($labelNames -contains 'in-progress'))" -DryRun:$DryRun
+            if (-not $DryRun) {
+                $state.status = 'released'
+                $state.reconcile_note = 'claim released by reconciliation (bot no longer holds)'
+                $state.updated_at = (Get-Date).ToUniversalTime().ToString('o')
+                Write-PipelineState -Path $sp -State $state | Out-Null
+                try {
+                    Invoke-Gh @('issue', 'edit', "$issueNum", '--repo', $repo,
+                        '--remove-assignee', $Config['bot_login'],
+                        '--remove-label', 'in-progress') | Out-Null
+                } catch {
+                    Write-ReconcileLog -Action 'warn' -Issue $d.Name -Reason "release GH cleanup failed: $($_.Exception.Message)" -DryRun:$DryRun
+                }
+            }
+            continue
+        }
+
+        # 4) PR open -> delivered but the workspace still says in_progress; sync it.
+        if ($null -ne $pr) {
+            $actions.Add([pscustomobject]@{ action = 'mark-pending-review'; issue = $issueNum; workspace = $d.Name; reason = "PR #$($pr.number) open" })
+            Write-ReconcileLog -Action 'mark-pending-review' -Issue $d.Name -Reason "PR #$($pr.number) open" -DryRun:$DryRun
+            if (-not $DryRun) {
+                $state.status = 'pending-review'
+                $state.pr_url = [string]$pr.url
+                $state.reconcile_note = 'PR open; synced pending-review'
+                $state.updated_at = (Get-Date).ToUniversalTime().ToString('o')
+                Write-PipelineState -Path $sp -State $state | Out-Null
+                try { Set-IssueLabel -IssueNumber $issueNum -Repo $repo -Add @('pending-review') -Remove @('in-progress') } catch {
+                    Write-Log "Reconcile: pending-review sync failed for #$issueNum : $($_.Exception.Message)" -Level 'WARN'
+                }
+            }
+            continue
+        }
+
+        # 5) Stale but owned with no PR -> reset staleness so the next poll resumes.
+        $age = $null
+        try { $age = ((Get-Date).ToUniversalTime() - [datetime]::Parse($state.updated_at)).TotalSeconds } catch { }
+        if ($null -ne $age -and $age -gt [int]$Config['ttl']) {
+            $actions.Add([pscustomobject]@{ action = 'resume'; issue = $issueNum; workspace = $d.Name; reason = "stale $([math]::Round($age))s but owned; staleness reset" })
+            Write-ReconcileLog -Action 'resume' -Issue $d.Name -Reason "stale $([math]::Round($age))s but owned; staleness reset" -DryRun:$DryRun
+            if (-not $DryRun) {
+                $state.updated_at = (Get-Date).ToUniversalTime().ToString('o')
+                $state.reconcile_note = 'staleness reset by reconciliation'
+                Write-PipelineState -Path $sp -State $state | Out-Null
+            }
+            continue
+        }
+
+        # 6) Healthy fresh claim -> no action.
+        Write-Log "Reconcile: $($d.Name) healthy — no action" -Level 'DEBUG'
+    }
+    return @($actions)
+}
+
+# ============================================================
 # Graceful shutdown (release claims on Ctrl+C / SIGTERM)
 # ============================================================
 $script:ShutdownRequested = $false
@@ -1227,6 +1557,28 @@ Write-Heartbeat
 # Startup reconciliation: reclaim anything the previous (possibly killed) run left.
 Release-OrphanedClaims
 Cleanup-OrphanedSandboxes
+
+# ---- gated reconciliation (self-heal) mode: one pass, then exit ----
+# The supervisor schedules this with `-ReconcileOnce`. The pass only runs when
+# Autonomad is QUIET (no live tick/sandbox/recent activity) AND an ATTENTION
+# condition exists. Otherwise it exits without touching anything.
+if ($ReconcileOnce) {
+    Write-Log "ReconcileOnce mode — gated claim reconciliation"
+    $quiet = Test-AutonomadQuiet
+    if (-not $quiet.quiet) {
+        Write-Log "Reconcile skipped: Autonomad activity present ($($quiet.reasons -join '; '))"
+        exit 0
+    }
+    $attention = Test-AttentionNeeded
+    if (-not $attention.attention) {
+        Write-Log "Reconcile skipped: no attention conditions (all claims healthy)"
+        exit 0
+    }
+    Write-Log "Reconcile gate PASSED (quiet + attention: $($attention.reasons -join '; '))"
+    $actions = Invoke-ReconcileClaims -DryRun:$ReconcileDryRun
+    Write-Log "Reconcile done: $($actions.Count) action(s)"
+    exit 0
+}
 
 $tickCount = 0
 $lastWorkAt = (Get-Date).ToUniversalTime()
