@@ -59,6 +59,15 @@ function Write-Log {
     Add-Content -LiteralPath $script:LogFile -Value $line -Encoding utf8
 }
 
+function Get-ErrorDetail {
+    param([System.Management.Automation.ErrorRecord]$ErrorRecord)
+    $msg = [string]$ErrorRecord.Exception.Message
+    $stack = [string]$ErrorRecord.ScriptStackTrace
+    if ([string]::IsNullOrWhiteSpace($stack)) { $stack = '  (no stack trace available)' }
+    if ($stack.Length -gt 2000) { $stack = $stack.Substring(0, 2000) + '…' }
+    return $msg + [Environment]::NewLine + $stack
+}
+
 function Get-SupervisorState {
     $state = [ordered]@{
         pid                   = $PID
@@ -185,6 +194,24 @@ function Test-GhAuth {
     }
 }
 
+# ---- top-level crash guard ----
+# Any terminating error that escapes the main loop (including outside the
+# per-cycle try, e.g. Test-DockerUp / Test-GhAuth) lands here: the stack is
+# written to supervisor-crash.log, the tick child is stopped, and the process
+# exits non-zero so ensure-autonomad.ps1 (or a human) can see why it died.
+$script:CrashLogFile = Join-Path $script:LogsDir 'supervisor-crash.log'
+trap {
+    $ts = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
+    $stack = if ($_.ScriptStackTrace) { $_.ScriptStackTrace } else { '  (no stack trace available)' }
+    $detail = "[$ts] SUPERVISOR CRASH: $($_.Exception.Message)`n$stack"
+    try { Add-Content -LiteralPath $script:CrashLogFile -Value $detail -Encoding utf8 } catch { }
+    Write-Host $detail
+    if ($null -ne $script:Tick) {
+        try { Stop-Process -Id $script:Tick.pid -Force -ErrorAction SilentlyContinue } catch { }
+    }
+    exit 1
+}
+
 # ---- init ----
 $script:StartedAt = (Get-Date).ToUniversalTime().ToString('o')
 $script:DockerUp = $false
@@ -273,7 +300,7 @@ while (-not $script:StopRequested) {
         Write-SupervisorState
     } catch {
         $script:LastError = $_.Exception.Message
-        Write-Log "Supervisor cycle error: $($_.Exception.Message)" -Level 'ERROR'
+        Write-Log "Supervisor cycle error: $(Get-ErrorDetail $_)" -Level 'ERROR'
         Write-SupervisorState
     }
 

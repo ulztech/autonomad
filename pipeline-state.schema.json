@@ -179,6 +179,11 @@
       "type": ["string", "null"],
       "description": "Last error message (for diagnostics)."
     },
+    "resume_cycles": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Consecutive dev runs that ended without a close-out condition. Halt with needs-human when this reaches resume_max_cycles."
+    },
     "pr_url": {
       "type": ["string", "null"],
       "description": "PR URL created at close-out."

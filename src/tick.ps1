@@ -903,16 +903,16 @@ function Close-OutIssue {
     } finally { Pop-Location }
     Write-Log "Pushed branch $branch"
 
-    # PR — reuse the root's open PR for a child; create a fresh PR otherwise.
+    # PR — reuse an existing open PR for the branch (idempotent close-out: a
+    # resume after a kill/restart must never re-create the PR — observed 75x
+    # duplicate-PR errors on resume); create only when none exists.
     $prUrl = $null
     $prNum = $null
-    if ($isChild) {
-        $existing = Get-OpenPrForBranch -Branch $branch -Repo $repo
-        if ($existing) {
-            $prUrl = $existing.url
-            $prNum = [string]$existing.number
-            Write-Log "Revision close-out: reusing open PR #$prNum for branch $branch"
-        }
+    $existing = Get-OpenPrForBranch -Branch $branch -Repo $repo
+    if ($existing) {
+        $prUrl = $existing.url
+        $prNum = [string]$existing.number
+        Write-Log "Close-out: reusing open PR #$prNum for branch $branch"
     }
     if (-not $prUrl) {
         $prBody = "Fixes #$($State.issue_number)`n`nAutonomad v1 — developed autonomously. See the report for details."
@@ -965,6 +965,55 @@ function Close-OutIssue {
 # ============================================================
 # Halt (T7)
 # ============================================================
+<#
+.SYNOPSIS
+  Format an error record for logging: message + ScriptStackTrace (trimmed).
+  Every catch site must log the stack — without it, crashes like the
+  "'and' parameter" bug are impossible to root-cause from logs alone.
+#>
+function Get-ErrorDetail {
+    param([System.Management.Automation.ErrorRecord]$ErrorRecord)
+    $msg = [string]$ErrorRecord.Exception.Message
+    $stack = [string]$ErrorRecord.ScriptStackTrace
+    if ([string]::IsNullOrWhiteSpace($stack)) { $stack = '  (no stack trace available)' }
+    if ($stack.Length -gt 2000) { $stack = $stack.Substring(0, 2000) + '…' }
+    return $msg + [Environment]::NewLine + $stack
+}
+
+<#
+.SYNOPSIS
+  Release a claim the tick crashed on: mark the workspace pipeline-state
+  'released' (resume scan skips it) and drop in-progress + assignee, so the
+  issue returns to the pool for a human or another agent instead of being
+  strangled by a garbage needs-human halt or a resume-crash loop.
+#>
+function Release-Claim {
+    [CmdletBinding()]
+    param([object]$Issue, [string]$Reason)
+    $repo = $Config['repo']
+    $ws = Join-Path $script:WorkspacesDir "issue-$($Issue.number)"
+    try {
+        $sp = Join-Path $ws 'pipeline-state.json'
+        if (Test-Path -LiteralPath $sp) {
+            try {
+                $st = Read-PipelineState -Path $sp -SchemaPath $script:SchemaPath
+                $st.status = 'released'
+                $st.halt_reason = $Reason
+                $st.last_error = $Reason
+                $st.updated_at = (Get-Date).ToUniversalTime().ToString('o')
+                Write-PipelineState -Path $sp -State $st | Out-Null
+                Commit-PipelineState -Workspace $ws -State $st -Message "claim released after crash: $Reason"
+            } catch {
+                Write-Log "Release-Claim: state update failed: $($_.Exception.Message)" -Level 'WARN'
+            }
+        }
+        & $script:GhBin issue edit "$($Issue.number)" --repo $repo --remove-label 'in-progress' --remove-assignee $Config['bot_login'] 2>&1 | Out-Null
+        Write-Log "RELEASE #$($Issue.number): claim released (reason: $Reason)" -Level 'WARN'
+    } catch {
+        Write-Log "Release-Claim failed for #$($Issue.number): $($_.Exception.Message)" -Level 'ERROR'
+    }
+}
+
 function Halt-Issue {
     [CmdletBinding()]
     param([object]$State, [object]$Issue, [string]$Reason)
@@ -1235,7 +1284,35 @@ function Process-Issue {
         return
     }
 
-    Write-Log "Dev run finished with status '$outcome' (no close-out condition) — will re-poll."
+    # --- no close-out condition: unknown outcome / run ended in_progress ---
+    # Guard the infinite resume loop: count the cycle, surface the agent's raw
+    # result shape (contract mismatch diagnosis), and escalate to needs-human
+    # once attempts (max_retries) or consecutive cycles (resume_max_cycles) hit
+    # their caps. Without this a dev run that never declares completion resumes
+    # from the same gate forever (observed 54 cycles on HRSystem-Legacy #317).
+    $resumeMax = if ($Config.ContainsKey('resume_max_cycles')) { [int]$Config['resume_max_cycles'] } else { 3 }
+    $cycles = [int](Get-StateProp $newState 'resume_cycles') + 1
+    $newState.attempts = [int]$newState.attempts + 1
+    $newState.resume_cycles = $cycles
+    $newState.last_error = "dev run ended '$outcome' without close-out (cycle $cycles/$resumeMax)"
+    $newState.updated_at = (Get-Date).ToUniversalTime().ToString('o')
+    Write-PipelineState -Path $statePath -State $newState | Out-Null
+    Commit-PipelineState -Workspace $workspace -State $newState -Message "cycle $($cycles): no close-out"
+    Write-Log "Dev run finished with status '$outcome' (no close-out condition) — cycle $cycles/$resumeMax (attempt $($newState.attempts)/$($Config['max_retries']))."
+    if ($agentResult) {
+        $shape = ($agentResult | ConvertTo-Json -Compress -Depth 4)
+        if ($shape.Length -gt 1000) { $shape = $shape.Substring(0, 1000) + '…' }
+        Write-Log "result.json shape: $shape" -Level 'DEBUG'
+    }
+    if ($cycles -ge $resumeMax) {
+        Halt-Issue -State $newState -Issue $Issue -Reason "$cycles consecutive dev runs without close-out (resume_max_cycles=$resumeMax); last outcome '$outcome'"
+        return
+    }
+    if ($newState.attempts -ge [int]$Config['max_retries']) {
+        Halt-Issue -State $newState -Issue $Issue -Reason "N=$($Config['max_retries']) failed attempts (incl. no-close-out cycles, hard stop)"
+        return
+    }
+    Write-Log "Retrying #$issueNum (no-close-out cycle $cycles, attempt $($newState.attempts))"
 }
 
 # ============================================================
@@ -1777,7 +1854,7 @@ while ($true) {
             Write-Heartbeat
             Process-Issue -Issue $issueView -Resume $resumable
         } catch {
-            Write-Log "Resume processing failed: $($_.Exception.Message)" -Level 'ERROR'
+            Write-Log "Resume processing failed: $(Get-ErrorDetail $_)" -Level 'ERROR'
         }
         $script:TickStatus = 'idle'
         $script:TickClaim = $null
@@ -1796,7 +1873,7 @@ while ($true) {
     try {
         $candidate = Get-CandidateIssue
     } catch {
-        Write-Log "Poll failed: $($_.Exception.Message)" -Level 'ERROR'
+        Write-Log "Poll failed: $(Get-ErrorDetail $_)" -Level 'ERROR'
     }
 
     if (-not $candidate) {
@@ -1824,15 +1901,11 @@ while ($true) {
         try {
             Process-Issue -Issue $candidate
         } catch {
-            Write-Log "Issue processing failed: $($_.Exception.Message)" -Level 'ERROR'
-            # Fails closed on unexpected errors -> needs-human on the claimed issue.
-            try {
-                Halt-Issue -State (New-PipelineState -IssueNumber $candidate.number -Repo $Config['repo'] `
-                    -Branch "$($Config['branch_prefix'])/issue-$($candidate.number)" -Owner $Config['bot_login']) `
-                    -Issue $candidate -Reason "unhandled tick error: $($_.Exception.Message)"
-            } catch {
-                Write-Log "Halt fallback also failed: $($_.Exception.Message)" -Level 'ERROR'
-            }
+            Write-Log "Issue processing failed: $(Get-ErrorDetail $_)" -Level 'ERROR'
+            # Crash path: release the claim (status=released, drop labels/assignee)
+            # instead of a garbage needs-human halt — the stack was logged above,
+            # a human or another agent can pick the issue up again.
+            Release-Claim -Issue $candidate -Reason "unhandled tick error: $($_.Exception.Message)"
         }
         $script:TickStatus = 'idle'
         $script:TickClaim = $null
