@@ -66,8 +66,16 @@ Write `/workspace/.autonomad/result.json` on completion:
   "confidence": 0.0,
   "fatal_flaw": false,
   "plan_escalation": false,
-  "summary": "short summary"
+  "summary": "short summary",
+  "handoff": "markdown handoff for the NEXT agent in a chained-ticket sequence"
 }
 ```
+
+`handoff` is **required on success**. Write a concise markdown note describing
+what this ticket changed (files, tables, interfaces, branch), what the next
+ticket in the chain needs (build prerequisites, new symbols, gotchas), and how
+to verify the change. The tick persists it to `<DataDir>/handoffs/` and injects
+it verbatim into the next chained ticket's prompt — so write it for that reader,
+not for a human reviewer.
 
 Commit all work to the issue branch. The tick loop handles push + PR.

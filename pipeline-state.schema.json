@@ -168,8 +168,8 @@
     },
     "status": {
       "type": "string",
-      "enum": ["claimed", "in_progress", "pending-review", "needs-human", "done", "skipped"],
-      "description": "Lifecycle status of this pipeline run."
+      "enum": ["claimed", "in_progress", "pending-review", "needs-human", "done", "skipped", "released", "closed-out", "resolved"],
+      "description": "Lifecycle status of this pipeline run. Reconcile may set released/closed-out/resolved when the bot no longer holds the claim."
     },
     "halt_reason": {
       "type": ["string", "null"],
@@ -182,6 +182,10 @@
     "pr_url": {
       "type": ["string", "null"],
       "description": "PR URL created at close-out."
+    },
+    "reconcile_note": {
+      "type": ["string", "null"],
+      "description": "Reason recorded by reconciliation when it releases/close-outs/resolves a claim."
     },
     "created_at": {
       "type": "string",

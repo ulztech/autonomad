@@ -41,7 +41,7 @@ run_agent() {
     # fallback so a 429/quota hit on the free tier does not strand the issue.
     # `--agent dev` selects the marketplace dev agent (registered by load_marketplace).
     local primary_model="${OPENCODE_MODEL:-}"
-    local fallback_model="deepseek/deepseek-v4-flash"
+    local fallback_model="opencode/deepseek-v4-flash-free"
     local models=()
     if [ -n "$primary_model" ] && [ "$primary_model" != "$fallback_model" ]; then
         models+=("$primary_model" "$fallback_model")
@@ -79,6 +79,37 @@ load_marketplace() {
     export OPENCODE_SKILLS_PATH="$(IFS=:; echo "${paths[*]}")"
     if [ -n "${AIOS_BRAIN:-}" ]; then
         export AIOS_BRAIN
+    fi
+
+    # Headless `opencode run` auto-rejects reads outside the workspace by
+    # default (`external_directory` = deny). The dev agent MUST be able to read
+    # its own spec (/opt/autonomad/marketplace), the AIOS brain (/brain) and the
+    # workspace, so write a permissive config for the sandbox.
+    CONFIG_DIR="${HOME:-/root}/.config/opencode"
+    mkdir -p "$CONFIG_DIR"
+    if [ ! -f "$CONFIG_DIR/opencode.json" ]; then
+        cat > "$CONFIG_DIR/opencode.json" <<'EOF'
+{
+  "$schema": "https://opencode.ai/config.json",
+  "permission": {
+    "read": "allow",
+    "edit": "allow",
+    "glob": "allow",
+    "grep": "allow",
+    "list": "allow",
+    "bash": "allow",
+    "task": "allow",
+    "external_directory": "allow",
+    "todowrite": "allow",
+    "question": "allow",
+    "webfetch": "allow",
+    "websearch": "allow",
+    "lsp": "allow",
+    "skill": "allow"
+  }
+}
+EOF
+        echo "[opencode] wrote $CONFIG_DIR/opencode.json (permissions: allow)"
     fi
 
     # Register marketplace agents so `opencode run --agent <name>` resolves them.

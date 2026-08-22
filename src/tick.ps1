@@ -55,7 +55,10 @@ $script:GhBin = if ($GhBin) { $GhBin } else {
 
 # --- load config + env ---
 $Config = Read-RepoConfig -ConfigPath $ConfigPath
-Import-EnvFile -EnvFilePath $EnvFile
+# Load .env into the process env. Capture the return — otherwise the parsed
+# hashtable (including API key values) is emitted to stdout. SECURITY: never
+# let .env contents reach stdout/logs.
+$null = Import-EnvFile -EnvFilePath $EnvFile
 $script:BrainRoot = if ($BrainRoot) { $BrainRoot } else {
     [System.Environment]::GetEnvironmentVariable('AIOS_BRAIN_PATH')
 }
@@ -65,6 +68,10 @@ $script:WorkspacesDir = Join-Path $DataDir 'workspaces'
 $script:ReportsDir = Join-Path $DataDir 'reports'
 $script:LogsDir = Join-Path $DataDir 'logs'
 $script:HeartbeatFile = Join-Path $DataDir 'last_tick.ts'
+$script:TickStateFile = Join-Path $DataDir 'tick-state.json'
+$script:TickStatus = 'idle'      # 'idle' | 'working' — read by the reconcile quiet-gate
+$script:TickClaim = $null        # issue-ref currently being processed, if any
+$script:LastWorkUtc = $null      # null = never worked a claim (fresh tick is idle)
 foreach ($d in @($DataDir, $script:WorkspacesDir, $script:ReportsDir, $script:LogsDir)) {
     if (-not (Test-Path -LiteralPath $d)) { New-Item -ItemType Directory -Path $d -Force | Out-Null }
 }
@@ -155,7 +162,7 @@ function Ensure-Labels {
 }
 
 function Set-IssueLabel {
-    param([int]$IssueNumber, [string[]]$Add, [string[]]$Remove, [string]$Repo = '')
+    param([int]$IssueNumber, [string[]]$Add = @(), [string[]]$Remove = @(), [string]$Repo = '')
     if ([string]::IsNullOrWhiteSpace($Repo)) { $Repo = $Config['repo'] }
     if ($Add.Count -gt 0) {
         Invoke-Gh @('issue', 'edit', "$IssueNumber", '--repo', $Repo, '--add-label', ($Add -join ',')) | Out-Null
@@ -180,10 +187,11 @@ function Get-IssueLabelNames {
 }
 
 function Add-IssueComment {
-    param([int]$IssueNumber, [string]$Body)
+    param([int]$IssueNumber, [string]$Body, [string]$Repo = '')
+    if ([string]::IsNullOrWhiteSpace($Repo)) { $Repo = $Config['repo'] }
     $bodyFile = Join-Path $script:DataDir "comment-$IssueNumber.md"
     [System.IO.File]::WriteAllText($bodyFile, $Body, (New-Object System.Text.UTF8Encoding($false)))
-    Invoke-Gh @('issue', 'comment', "$IssueNumber", '--repo', $Config['repo'], '--body-file', $bodyFile) | Out-Null
+    Invoke-Gh @('issue', 'comment', "$IssueNumber", '--repo', $Repo, '--body-file', $bodyFile) | Out-Null
     Remove-Item -LiteralPath $bodyFile -Force
 }
 
@@ -216,8 +224,9 @@ $script:GateDisplayNames = @{
 function Sync-IssueChecklist {
     [CmdletBinding()]
     param([int]$IssueNumber, [object]$State)
+    $repo = $State.repo ?? $Config['repo']
     try {
-        $view = Invoke-Gh @('issue', 'view', "$IssueNumber", '--repo', $Config['repo'],
+        $view = Invoke-Gh @('issue', 'view', "$IssueNumber", '--repo', $repo,
             '--json', 'body') | ConvertFrom-Json
     } catch {
         Write-Log "Checklist sync: cannot read issue body: $($_.Exception.Message)" -Level 'WARN'
@@ -242,7 +251,7 @@ function Sync-IssueChecklist {
     try {
         $bodyFile = Join-Path $script:DataDir "checklist-$IssueNumber.md"
         [System.IO.File]::WriteAllText($bodyFile, $newBody, (New-Object System.Text.UTF8Encoding($false)))
-        Invoke-Gh @('issue', 'edit', "$IssueNumber", '--repo', $Config['repo'], '--body-file', $bodyFile) | Out-Null
+        Invoke-Gh @('issue', 'edit', "$IssueNumber", '--repo', $repo, '--body-file', $bodyFile) | Out-Null
         Remove-Item -LiteralPath $bodyFile -Force
         Write-Log "Checklist synced for #$IssueNumber" -Level 'DEBUG'
     } catch {
@@ -263,7 +272,8 @@ function Add-GateComment {
         [string]$Status,      # pass | fail | blocked
         [string]$Agent = 'autonomad-tick',
         [hashtable]$Fields = @{},
-        [string]$Summary = ''
+        [string]$Summary = '',
+        [string]$Repo = ''
     )
     $lines = @(
         "## Gate: $Gate — $Status",
@@ -279,7 +289,7 @@ function Add-GateComment {
     if ($Summary) {
         $lines += '', '### Summary', $Summary
     }
-    Add-IssueComment -IssueNumber $IssueNumber -Body ($lines -join "`n")
+    Add-IssueComment -IssueNumber $IssueNumber -Body ($lines -join "`n") -Repo $Repo
 }
 
 <#
@@ -297,7 +307,8 @@ function Add-TrackingComment {
         [Parameter(Mandatory = $true)][int]$TrackingRef,
         [int]$RootRef = 0,
         [string]$Branch = '',
-        [string]$PrUrl = ''
+        [string]$PrUrl = '',
+        [string]$Repo = ''
     )
     $lines = @(
         '## Tracking',
@@ -310,7 +321,7 @@ function Add-TrackingComment {
         "| pr | $($PrUrl -replace '\|', '&#124;') |"
     )
     try {
-        Add-IssueComment -IssueNumber $IssueNumber -Body ($lines -join "`n")
+        Add-IssueComment -IssueNumber $IssueNumber -Body ($lines -join "`n") -Repo $Repo
         $resolvedRoot = if ($RootRef -gt 0) { $RootRef } else { $TrackingRef }
         Write-Log "Tracking comment posted for #$IssueNumber (tracking_ref #$TrackingRef, root #$resolvedRoot)"
     } catch {
@@ -331,8 +342,17 @@ function Get-DependencyRefs {
     param([string]$Body)
     if ([string]::IsNullOrWhiteSpace($Body)) { return ,@() }
     $refs = @()
+    # Inline form: "Blocked by #316" / "Depends on #316".
     foreach ($m in [regex]::Matches($Body, '(?i)(?:depends\s+on|blocked\s+by)\s+#(\d+)')) {
         $refs += [int]$m.Groups[1].Value
+    }
+    # Markdown-list form: a "Blocked by" / "Depends on" section whose following
+    # list items are "- #N — description". Collect #N until the next heading.
+    foreach ($m in [regex]::Matches($Body, '(?is)(?:depends\s+on|blocked\s+by)\b[^\r\n]*(?:\r?\n)(.*?)(?=\r?\n#{1,6}\s|\Z)')) {
+        $section = $m.Groups[1].Value
+        foreach ($item in [regex]::Matches($section, '(?im)^\s*(?:-|•|\*)?\s*#(\d+)\b')) {
+            $refs += [int]$item.Groups[1].Value
+        }
     }
     # `,@()` keeps the result an array even when empty (a bare empty array is
     # unrolled to $null on return, and .Count on $null throws under StrictMode).
@@ -366,17 +386,19 @@ function Resolve-RootRef {
     [CmdletBinding()]
     param(
         [object]$Issue,
+        [string]$Repo = '',
         [hashtable]$Seen = @{}
     )
     if ($null -eq $Issue) { return $null }
+    if ([string]::IsNullOrWhiteSpace($Repo)) { $Repo = $Config['repo'] }
     $parent = Get-ParentRef -Body $Issue.body
     if ($null -eq $parent) { return [int]$Issue.number }
     if ($Seen.ContainsKey($Issue.number.ToString())) { return [int]$Issue.number }
     $Seen[$Issue.number.ToString()] = $true
     try {
-        $view = Invoke-Gh @('issue', 'view', "$parent", '--repo', $Config['repo'],
+        $view = Invoke-Gh @('issue', 'view', "$parent", '--repo', $Repo,
             '--json', 'number,body') | ConvertFrom-Json
-        return Resolve-RootRef -Issue $view -Seen $Seen
+        return Resolve-RootRef -Issue $view -Repo $Repo -Seen $Seen
     } catch {
         Write-Log "Cannot resolve parent #$parent for #$($Issue.number): $($_.Exception.Message) — treating as root" -Level 'WARN'
         return [int]$Issue.number
@@ -675,6 +697,8 @@ Title: $(if ($Issue) { $Issue.title } else { $State.issue_ref })
 Body:
 $(if ($Issue) { $Issue.body } else { '' })
 
+$(Get-HandoffsForIssue -Issue $Issue)
+
 ## Repo configuration
 - Harness: $($State.harness)
 - Model override: $(if ($State.model) { $State.model } else { '<harness default>' })
@@ -739,8 +763,14 @@ Report your outcome in /workspace/.autonomad/result.json with this shape:
   "confidence": 0.0-1.0,
   "fatal_flaw": bool,
   "plan_escalation": bool,
-  "summary": "short summary"
+  "summary": "short summary",
+  "handoff": "markdown handoff for the NEXT agent in a chained-ticket sequence"
 }
+The `handoff` field is REQUIRED on success. It must be a concise markdown note
+describing what this ticket changed, which files/tables/branches were touched,
+what the next ticket in the chain needs to know (build prerequisites, new
+interfaces/models, gotchas), and how to verify the change. The next agent reads
+this verbatim, so write it for that reader.
 "@
 }
 
@@ -764,6 +794,53 @@ function Read-ResultJson {
     }
 }
 
+<#
+.SYNOPSIS
+  Persist the dev agent's handoff note so the NEXT agent in a chained-ticket
+  sequence can read what this ticket changed. Stored as
+  <DataDir>/handoffs/issue-<N>.md (UTF-8). The next Build-DevPrompt injects any
+  matching handoff for the ticket's dependencies. No-op when the agent supplied
+  no handoff (e.g. needs-human / failed runs).
+#>
+function Save-Handoff {
+    [CmdletBinding()]
+    param([object]$AgentResult, [object]$State)
+    if ($null -eq $AgentResult) { return }
+    $handoff = if ($AgentResult.PSObject.Properties.Name -contains 'handoff') { [string]$AgentResult.handoff } else { '' }
+    if ([string]::IsNullOrWhiteSpace($handoff)) { return }
+    $handoffDir = Join-Path $script:DataDir 'handoffs'
+    if (-not (Test-Path -LiteralPath $handoffDir)) { New-Item -ItemType Directory -Path $handoffDir -Force | Out-Null }
+    $issueRef = $State.issue_ref
+    $target = Join-Path $handoffDir "$issueRef.md"
+    [System.IO.File]::WriteAllText($target, $handoff.TrimEnd() + "`n", (New-Object System.Text.UTF8Encoding($false)))
+    Write-Log "Handoff saved for $issueRef → $target"
+}
+
+<#
+.SYNOPSIS
+  Load handoff notes for any dependency issues the current ticket declares
+  (`Blocked by #N` / `Depends on #N`) so the chained-ticket agent sees what the
+  upstream ticket changed. Returns a markdown block or '' when none exist.
+#>
+function Get-HandoffsForIssue {
+    [CmdletBinding()]
+    param([object]$Issue)
+    if ($null -eq $Issue -or [string]::IsNullOrWhiteSpace($Issue.body)) { return '' }
+    $deps = Get-DependencyRefs -Body $Issue.body
+    if ($deps.Count -eq 0) { return '' }
+    $handoffDir = Join-Path $script:DataDir 'handoffs'
+    if (-not (Test-Path -LiteralPath $handoffDir)) { return '' }
+    $blocks = @()
+    foreach ($dep in $deps) {
+        $f = Join-Path $handoffDir "issue-$dep.md"
+        if (Test-Path -LiteralPath $f) {
+            $blocks += "### Handoff from upstream ticket #$dep`n`n$((Get-Content -LiteralPath $f -Raw).TrimEnd())`n"
+        }
+    }
+    if ($blocks.Count -eq 0) { return '' }
+    return "## Upstream handoffs`n`n$($blocks -join "`n")"
+}
+
 # ============================================================
 # Close-out (T6)
 # ============================================================
@@ -775,9 +852,10 @@ function Read-ResultJson {
 #>
 function Get-OpenPrForBranch {
     [CmdletBinding()]
-    param([string]$Branch)
+    param([string]$Branch, [string]$Repo = '')
+    if ([string]::IsNullOrWhiteSpace($Repo)) { $Repo = $Config['repo'] }
     try {
-        $json = Invoke-Gh @('pr', 'list', '--repo', $Config['repo'], '--head', $Branch,
+        $json = Invoke-Gh @('pr', 'list', '--repo', $Repo, '--head', $Branch,
             '--state', 'open', '--json', 'number,url,title') | ConvertFrom-Json
         $items = @($json)
         if ($items.Count -eq 0) { return $null }
@@ -794,10 +872,11 @@ function Get-OpenPrForBranch {
 #>
 function Add-PrComment {
     [CmdletBinding()]
-    param([string]$PrNumber, [string]$Body)
+    param([string]$PrNumber, [string]$Body, [string]$Repo = '')
+    if ([string]::IsNullOrWhiteSpace($Repo)) { $Repo = $Config['repo'] }
     $bodyFile = Join-Path $script:DataDir "pr-comment-$PrNumber.md"
     [System.IO.File]::WriteAllText($bodyFile, $Body, (New-Object System.Text.UTF8Encoding($false)))
-    Invoke-Gh @('pr', 'comment', "$PrNumber", '--repo', $Config['repo'], '--body-file', $bodyFile) | Out-Null
+    Invoke-Gh @('pr', 'comment', "$PrNumber", '--repo', $Repo, '--body-file', $bodyFile) | Out-Null
     Remove-Item -LiteralPath $bodyFile -Force
 }
 
@@ -807,6 +886,7 @@ function Close-OutIssue {
 
     $branch = $State.branch
     $issueRef = $State.issue_ref
+    $repo = $State.repo ?? $Config['repo']
     # A child (revision) ticket reuses the ROOT's branch and PR — never a new PR.
     $isChild = Test-IsRevisionChild -State $State
 
@@ -827,7 +907,7 @@ function Close-OutIssue {
     $prUrl = $null
     $prNum = $null
     if ($isChild) {
-        $existing = Get-OpenPrForBranch -Branch $branch
+        $existing = Get-OpenPrForBranch -Branch $branch -Repo $repo
         if ($existing) {
             $prUrl = $existing.url
             $prNum = [string]$existing.number
@@ -838,7 +918,7 @@ function Close-OutIssue {
         $prBody = "Fixes #$($State.issue_number)`n`nAutonomad v1 — developed autonomously. See the report for details."
         $prBodyFile = Join-Path $script:DataDir "pr-body-$issueRef.md"
         [System.IO.File]::WriteAllText($prBodyFile, $prBody, (New-Object System.Text.UTF8Encoding($false)))
-        $prOut = Invoke-Gh @('pr', 'create', '--repo', $Config['repo'], '--title', "Autonomad: $($Issue.title)",
+        $prOut = Invoke-Gh @('pr', 'create', '--repo', $repo, '--title', "Autonomad: $($Issue.title)",
             '--body-file', $prBodyFile, '--head', $branch, '--base', $Config['base_branch']) | Out-String
         Remove-Item -LiteralPath $prBodyFile -Force
         $prUrl = ($prOut | Select-String -Pattern 'https://github.com/.*/pull/\d+' | Select-Object -First 1).Matches.Value
@@ -850,7 +930,7 @@ function Close-OutIssue {
     # Revision note on the reused root PR (the root's `Fixes #N` body stays intact).
     if ($isChild -and $prNum) {
         try {
-            Add-PrComment -PrNumber $prNum -Body "Autonomad revision for #$($State.issue_number) — re-requesting review. See child ticket #$($State.issue_number) for the requested changes."
+            Add-PrComment -PrNumber $prNum -Body "Autonomad revision for #$($State.issue_number) — re-requesting review. See child ticket #$($State.issue_number) for the requested changes." -Repo $repo
             Write-Log "Revision note appended to PR #$prNum"
         } catch {
             Write-Log "Revision PR comment failed: $($_.Exception.Message)" -Level 'WARN'
@@ -858,7 +938,7 @@ function Close-OutIssue {
     }
 
     # Label pending-review
-    Set-IssueLabel -IssueNumber $State.issue_number -Add @('pending-review') -Remove @('in-progress')
+    Set-IssueLabel -IssueNumber $State.issue_number -Repo $repo -Add @('pending-review') -Remove @('in-progress')
 
     # Update state
     $State.status = 'pending-review'
@@ -876,7 +956,8 @@ function Close-OutIssue {
     Sync-IssueChecklist -IssueNumber $State.issue_number -State $State
     Add-GateComment -IssueNumber $State.issue_number -Gate 'github_sync' -Status 'pass' `
         -Fields @{ 'pr_url' = $prUrl; 'report' = "reports/$issueRef.html"; 'branch' = $branch } `
-        -Summary "Autonomad v1.5 finished #$($State.issue_number). PR opened; checklist completed; pending human review."
+        -Summary "Autonomad v1.5 finished #$($State.issue_number). PR opened; checklist completed; pending human review." `
+        -Repo $repo
 
     return $State
 }
@@ -888,6 +969,7 @@ function Halt-Issue {
     [CmdletBinding()]
     param([object]$State, [object]$Issue, [string]$Reason)
     Write-Log "HALT #$($State.issue_number): $Reason" -Level 'WARN'
+    $repo = $State.repo ?? $Config['repo']
     $State.status = 'needs-human'
     $State.halt_reason = $Reason
     $State.current_step = 'halted'
@@ -898,10 +980,10 @@ function Halt-Issue {
         Commit-PipelineState -Workspace (Join-Path $script:WorkspacesDir $State.issue_ref) -State $State -Message "halt: needs-human"
     }
     try {
-        Set-IssueLabel -IssueNumber $State.issue_number -Add @('needs-human') -Remove @('in-progress', 'autonomous')
+        Set-IssueLabel -IssueNumber $State.issue_number -Repo $repo -Add @('needs-human') -Remove @('in-progress', 'autonomous')
         # Structured gate comment (display-sync pattern) replaces the ad-hoc line.
         Add-GateComment -IssueNumber $State.issue_number -Gate ($State.current_step ?? 'halt') `
-            -Status 'blocked' -Summary "Autonomad halted and needs a human. Reason: $Reason"
+            -Status 'blocked' -Summary "Autonomad halted and needs a human. Reason: $Reason" -Repo $repo
         Sync-IssueChecklist -IssueNumber $State.issue_number -State $State
     } catch {
         Write-Log "Halt label/comment failed: $($_.Exception.Message)" -Level 'WARN'
@@ -922,7 +1004,17 @@ function Find-ResumableIssue {
         try {
             $state = Read-PipelineState -Path $statePath -SchemaPath $script:SchemaPath
         } catch {
-            # Fails closed: an unreadable state is a plan-level failure -> halt
+            # Fails closed: an unreadable state is a plan-level failure -> halt.
+            # A state file WITHOUT schema_version is a FOREIGN artifact (e.g. an AIOS
+            # orchestrator pipeline written into this DataDir) — not an Autonomad
+            # claim, so skip it silently instead of warning on every poll.
+            try {
+                $raw = Get-Content -LiteralPath $statePath -Raw -ErrorAction Stop
+                if ($raw -notmatch '"schema_version"\s*:') {
+                    Write-Log "Resume scan: $($dir.Name) is not an Autonomad workspace (foreign pipeline-state) — skipping" -Level 'DEBUG'
+                    continue
+                }
+            } catch { }
             Write-Log "Resume scan: unreadable pipeline-state in $($dir.Name): $($_.Exception.Message)" -Level 'WARN'
             continue
         }
@@ -931,9 +1023,32 @@ function Find-ResumableIssue {
             continue
         }
         if ($state.status -in @('claimed', 'in_progress')) {
-            # TTL-stale -> HALT with needs-human + comment (m7). Silently skipping
-            # would strand the claim: the issue keeps the bot's assignee and the
-            # in-progress label forever, so no human or bot can pick it up.
+            # Confirm the issue is still open + still HELD by the bot (assigned AND
+            # in-progress label present) BEFORE any TTL handling. A human may have
+            # released the claim (removing in-progress / adding ready-for-agent)
+            # even while the bot is still assigned — resuming or even touching the
+            # workspace for a released claim would override that decision. Released
+            # claims are reconciled locally by the self-heal pass instead.
+            try {
+                # Workspaces record their own target repo (a run may have overridden
+                # repo.config, e.g. a HRSystem-Legacy targeted run). Fall back to config.
+                $repo = [string]$state.repo
+                if ([string]::IsNullOrWhiteSpace($repo)) { $repo = $Config['repo'] }
+                $view = Invoke-Gh @('issue', 'view', "$($state.issue_number)", '--repo', $repo,
+                    '--json', 'state,assignees,labels') | ConvertFrom-Json
+                if ($view.state -ne 'OPEN') { Write-Log "Skipping $($dir.Name): issue not open"; continue }
+                $labelNames = Get-IssueLabelNames -Issue $view
+                if (-not (Test-IssueClaimedByBot -Issue $view)) { Write-Log "Skipping $($dir.Name): not assigned to bot"; continue }
+                if ($labelNames -notcontains 'in-progress') { Write-Log "Skipping $($dir.Name): claim released (in-progress label removed)"; continue }
+            } catch {
+                Write-Log "Skipping $($dir.Name): cannot verify issue state: $($_.Exception.Message)" -Level 'WARN'
+                continue
+            }
+            # TTL-stale handling comes AFTER the held-check, so only claims still
+            # owned by the bot reach this point. Silently skipping a stale claim
+            # would strand it (assignee + in-progress label forever) — so reset
+            # and resume it THIS poll. attempts/max_retries still escalate to a
+            # real halt inside Process-Issue when the work cannot complete.
             $age = $null
             try {
                 $updated = [datetime]::Parse($state.updated_at)
@@ -949,11 +1064,7 @@ function Find-ResumableIssue {
             }
             if ($age -gt $ttlSeconds) {
                 if (ConvertTo-Bool $Config['reconcile_stale']) {
-                    # Self-heal path (reconcile_stale on, default): the claim is stale but
-                    # still owned by the bot. Reset its clock so the next poll resumes it
-                    # instead of stranding it forever. attempts/max_retries still escalate
-                    # to a real halt inside Process-Issue when the work cannot complete.
-                    Write-Log "TTL-stale $($dir.Name) ($([math]::Round($age))s > ${ttlSeconds}s) — resetting staleness for resume (reconcile_stale on)" -Level 'WARN'
+                    Write-Log "TTL-stale $($dir.Name) ($([math]::Round($age))s > ${ttlSeconds}s) — resetting staleness for immediate resume (reconcile_stale on)" -Level 'WARN'
                     $state.updated_at = (Get-Date).ToUniversalTime().ToString('o')
                     Write-PipelineState -Path $statePath -State $state | Out-Null
                 } else {
@@ -963,24 +1074,8 @@ function Find-ResumableIssue {
                     } catch {
                         Write-Log "TTL-stale halt failed for $($dir.Name): $($_.Exception.Message)" -Level 'ERROR'
                     }
+                    continue
                 }
-                continue
-            }
-            # Confirm the issue is still open + still HELD by the bot (assigned AND
-            # in-progress label present). A human may have released the claim by
-            # removing in-progress / adding ready-for-agent even while the bot is
-            # still assigned — resuming it would override that decision. Released
-            # claims are reconciled locally by the self-heal pass instead.
-            try {
-                $view = Invoke-Gh @('issue', 'view', "$($state.issue_number)", '--repo', $Config['repo'],
-                    '--json', 'state,assignees,labels') | ConvertFrom-Json
-                if ($view.state -ne 'OPEN') { Write-Log "Skipping $($dir.Name): issue not open"; continue }
-                $labelNames = Get-IssueLabelNames -Issue $view
-                if (-not (Test-IssueClaimedByBot -Issue $view)) { Write-Log "Skipping $($dir.Name): not assigned to bot"; continue }
-                if ($labelNames -notcontains 'in-progress') { Write-Log "Skipping $($dir.Name): claim released (in-progress label removed)"; continue }
-            } catch {
-                Write-Log "Skipping $($dir.Name): cannot verify issue state: $($_.Exception.Message)" -Level 'WARN'
-                continue
             }
             return @{ State = $state; Workspace = $dir.FullName }
         }
@@ -1006,7 +1101,9 @@ function Process-Issue {
     $parentRef = Get-ParentRef -Body $Issue.body
     $rootRef = $null
     if ($null -ne $parentRef) {
-        $rootRef = Resolve-RootRef -Issue $Issue
+        $resolveRepo = $Config['repo']
+        if ($Resume -and $Resume.State.repo) { $resolveRepo = $Resume.State.repo }
+        $rootRef = Resolve-RootRef -Issue $Issue -Repo $resolveRepo
         if ($null -ne $rootRef) {
             $branch = "$($Config['branch_prefix'])/issue-$rootRef"
             Write-Log "#$issueNum is a revision child of #$parentRef (root #$rootRef) — reusing branch $branch"
@@ -1128,6 +1225,9 @@ function Process-Issue {
         $newState = Close-OutIssue -State $newState -Issue $Issue -Workspace $workspace
         Write-PipelineState -Path $statePath -State $newState | Out-Null
         Commit-PipelineState -Workspace $workspace -State $newState -Message "close-out: PR created"
+        # Handoff (chained-ticket continuity): persist the agent's note for the
+        # next ticket in the sequence before learning harvest.
+        Save-Handoff -AgentResult $agentResult -State $newState
         # Harvest (T8)
         & (Join-Path $PSScriptRoot 'learn.ps1') -State $newState -Workspace $workspace -DataDir $script:DataDir -Mode closeout
         if ($LASTEXITCODE -ne 0) { Write-Log "learn.ps1 (closeout) failed (exit $LASTEXITCODE)" -Level 'WARN' }
@@ -1142,7 +1242,20 @@ function Process-Issue {
 # Main loop
 # ============================================================
 function Write-Heartbeat {
-    [System.IO.File]::WriteAllText($script:HeartbeatFile, (Get-Date).ToUniversalTime().ToString('o'), (New-Object System.Text.UTF8Encoding($false)))
+    $now = (Get-Date).ToUniversalTime()
+    [System.IO.File]::WriteAllText($script:HeartbeatFile, $now.ToString('o'), (New-Object System.Text.UTF8Encoding($false)))
+    # Structured tick-state heartbeat: the gated reconcile quiet-gate reads this
+    # to distinguish an IDLE poll loop (quiet — reconcile may run) from ACTIVE
+    # claim processing (not quiet — reconcile must wait).
+    $state = [ordered]@{
+        pid           = [int]$PID
+        status        = [string]$script:TickStatus
+        claim         = $script:TickClaim
+        last_poll_utc = $now.ToString('o')
+        last_work_utc = $(if ($script:LastWorkUtc) { $script:LastWorkUtc.ToString('o') } else { $null })
+        updated_at    = $now.ToString('o')
+    }
+    [System.IO.File]::WriteAllText($script:TickStateFile, ($state | ConvertTo-Json -Compress), (New-Object System.Text.UTF8Encoding($false)))
 }
 
 <#
@@ -1281,6 +1394,11 @@ function Test-AutonomadQuiet {
 
     # 1) Another tick process running. Exclude THIS process and every ancestor
     #    (a shell that launched us may carry 'tick.ps1' in its own command line).
+    #    v2: an IDLE tick (heartbeat says idle and it has not worked a claim
+    #    within activity_window) does NOT block reconciliation — a healthy
+    #    always-on loop polls forever and would otherwise suppress self-heal
+    #    indefinitely. Only ACTIVE work (status=working, or a recent claim
+    #    finish, or no heartbeat to prove idle) counts as activity.
     $skip = [System.Collections.Generic.HashSet[int]]::new()
     $null = $skip.Add([int]$PID)
     $cur = $PID
@@ -1293,17 +1411,47 @@ function Test-AutonomadQuiet {
             $null = $skip.Add($cur)
         }
     } catch { }
+
+    $tickState = $null
+    try {
+        if (Test-Path -LiteralPath $script:TickStateFile) {
+            $tickState = Get-Content -LiteralPath $script:TickStateFile -Raw | ConvertFrom-Json
+        }
+    } catch { $tickState = $null }
+
+    $liveTickPids = [System.Collections.Generic.List[int]]::new()
     try {
         $procs = Get-CimInstance Win32_Process -Filter "Name='pwsh.exe' OR Name='powershell.exe'" -ErrorAction SilentlyContinue
         foreach ($p in $procs) {
             $pidN = [int]$p.ProcessId
             if ($skip.Contains($pidN)) { continue }
             if ($p.CommandLine -and $p.CommandLine -match 'tick\.ps1') {
-                $reasons.Add("live tick pid $pidN")
-                break
+                $liveTickPids.Add($pidN)
             }
         }
     } catch { }
+
+    $tickBusy = $false
+    if ($liveTickPids.Count -gt 0) {
+        # Heartbeat present and claims idle? Trust it only if its pid is alive and
+        # no claim has been worked within activity_window.
+        if ($null -ne $tickState) {
+            $hbPidAlive = $false
+            try { $hbPidAlive = ($liveTickPids -contains [int]$tickState.pid) } catch { }
+            $lastWork = $null
+            try { $lastWork = [datetime]::Parse([string]$tickState.last_work_utc) } catch { }
+            $workedRecently = ($null -ne $lastWork -and ((Get-Date).ToUniversalTime() - $lastWork).TotalSeconds -le $window)
+            if (-not $hbPidAlive -or [string]$tickState.status -eq 'working' -or $workedRecently) {
+                $tickBusy = $true
+            }
+        } else {
+            # No heartbeat (older tick) -> fall back to treating the live tick as activity.
+            $tickBusy = $true
+        }
+        if ($tickBusy) {
+            $reasons.Add("live tick pid $($liveTickPids[0]) active")
+        }
+    }
 
     # 2) Autonomad sandbox containers.
     try {
@@ -1404,11 +1552,11 @@ function Invoke-ReconcileClaims {
     $actions = [System.Collections.Generic.List[object]]::new()
     if (-not (ConvertTo-Bool $Config['reconcile_stale'])) {
         Write-Log 'Reconcile: reconcile_stale=false — pass skipped' -Level 'INFO'
-        return @($actions)
+        return ,@($actions)
     }
     if (-not (Test-Path -LiteralPath $script:WorkspacesDir)) {
         Write-Log 'Reconcile: no workspaces dir — nothing to reconcile' -Level 'INFO'
-        return @($actions)
+        return ,@($actions)
     }
 
     foreach ($d in (Get-ChildItem -LiteralPath $script:WorkspacesDir -Directory | Sort-Object Name)) {
@@ -1417,8 +1565,23 @@ function Invoke-ReconcileClaims {
         try {
             $state = Read-PipelineState -Path $sp -SchemaPath $script:SchemaPath
         } catch {
+            # A state file WITHOUT schema_version is a FOREIGN artifact (e.g. an AIOS
+            # orchestrator pipeline) — not an Autonomad claim; skip silently instead
+            # of warning on every reconciliation pass.
+            try {
+                $raw = Get-Content -LiteralPath $sp -Raw -ErrorAction Stop
+                if ($raw -notmatch '"schema_version"\s*:') {
+                    Write-Log "Reconcile: $($d.Name) is not an Autonomad workspace (foreign pipeline-state) — skipping" -Level 'DEBUG'
+                    continue
+                }
+            } catch { }
             Write-ReconcileLog -Action 'warn' -Issue $d.Name -Reason "unreadable state: $($_.Exception.Message)" -DryRun:$DryRun
             continue
+        }
+        # Older state files predate the reconcile_note schema property; ensure the
+        # property exists before any reconciliation writes to it (StrictMode-safe).
+        if ($null -eq $state.PSObject.Properties['reconcile_note']) {
+            $state | Add-Member -NotePropertyName 'reconcile_note' -NotePropertyValue '' -Force
         }
         try { $issueNum = [int]$state.issue_number } catch { continue }
         if ($issueNum -le 0) { continue }
@@ -1500,8 +1663,10 @@ function Invoke-ReconcileClaims {
             continue
         }
 
-        # 4) PR open -> delivered but the workspace still says in_progress; sync it.
-        if ($null -ne $pr) {
+        # 4) PR OPEN -> delivered but the workspace still says in_progress; sync it.
+        #    A MERGED PR must not trigger this (a revision child reuses the root's
+        #    branch, whose PR may already be merged — that is not 'delivered').
+        if ($null -ne $pr -and -not $prMerged) {
             $actions.Add([pscustomobject]@{ action = 'mark-pending-review'; issue = $issueNum; workspace = $d.Name; reason = "PR #$($pr.number) open" })
             Write-ReconcileLog -Action 'mark-pending-review' -Issue $d.Name -Reason "PR #$($pr.number) open" -DryRun:$DryRun
             if (-not $DryRun) {
@@ -1534,7 +1699,7 @@ function Invoke-ReconcileClaims {
         # 6) Healthy fresh claim -> no action.
         Write-Log "Reconcile: $($d.Name) healthy — no action" -Level 'DEBUG'
     }
-    return @($actions)
+    return ,@($actions)
 }
 
 # ============================================================
@@ -1603,12 +1768,21 @@ while ($true) {
     $resumable = Find-ResumableIssue
     if ($resumable) {
         try {
-            $issueView = Invoke-Gh @('issue', 'view', "$($resumable.State.issue_number)", '--repo', $Config['repo'],
+            $resumeRepo = $resumable.State.repo ?? $Config['repo']
+            $issueView = Invoke-Gh @('issue', 'view', "$($resumable.State.issue_number)", '--repo', $resumeRepo,
                 '--json', 'number,title,url,body,labels,assignees') | ConvertFrom-Json
+            $script:TickStatus = 'working'
+            $script:TickClaim = $resumable.State.issue_ref
+            $script:LastWorkUtc = (Get-Date).ToUniversalTime()
+            Write-Heartbeat
             Process-Issue -Issue $issueView -Resume $resumable
         } catch {
             Write-Log "Resume processing failed: $($_.Exception.Message)" -Level 'ERROR'
         }
+        $script:TickStatus = 'idle'
+        $script:TickClaim = $null
+        $script:LastWorkUtc = (Get-Date).ToUniversalTime()
+        Write-Heartbeat
         $lastWorkAt = (Get-Date).ToUniversalTime()
         if ($Once) { exit 0 }
         # m8: backoff between resume attempts. Without this, a workspace that
@@ -1643,6 +1817,10 @@ while ($true) {
     if (Claim-Issue -IssueNumber $candidate.number) {
         Write-Log "Claimed #$($candidate.number)"
         $lastWorkAt = (Get-Date).ToUniversalTime()
+        $script:TickStatus = 'working'
+        $script:TickClaim = "issue-$($candidate.number)"
+        $script:LastWorkUtc = (Get-Date).ToUniversalTime()
+        Write-Heartbeat
         try {
             Process-Issue -Issue $candidate
         } catch {
@@ -1656,6 +1834,10 @@ while ($true) {
                 Write-Log "Halt fallback also failed: $($_.Exception.Message)" -Level 'ERROR'
             }
         }
+        $script:TickStatus = 'idle'
+        $script:TickClaim = $null
+        $script:LastWorkUtc = (Get-Date).ToUniversalTime()
+        Write-Heartbeat
     } else {
         Write-Log "Could not claim #$($candidate.number) (race or labels changed)."
     }

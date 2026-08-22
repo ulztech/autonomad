@@ -118,7 +118,7 @@ function Get-TtlSeconds {
 }
 
 function Get-Verdict {
-    param([object]$State, [object]$Result, $AgeSec, [int]$Ttl)
+    param([object]$State, [object]$Result, $AgeSec, [int]$Ttl, [bool]$LiveCtn = $false)
     $rawStatus = ''
     $step = ''
     if ($null -ne $State) {
@@ -131,6 +131,11 @@ function Get-Verdict {
         return [pscustomobject]@{ status = 'needs-human'; label = 'Needs Human'; level = 'crit'; stale = $stale }
     }
     if ($rawStatus -in @('claimed', 'in_progress') -or $step -in @('claimed', 'in_progress')) {
+        # A live sandbox container proves the dev run is active — never stale,
+        # even if the on-disk state file lags behind (it only advances at run end).
+        if ($LiveCtn) {
+            return [pscustomobject]@{ status = 'working'; label = 'Dev Running'; level = 'active'; stale = $false }
+        }
         $lv = if ($stale) { 'warn' } else { 'active' }
         return [pscustomobject]@{ status = 'in_progress'; label = 'In Progress'; level = $lv; stale = $stale }
     }
@@ -302,7 +307,7 @@ function Get-ClaimQueue {
 }
 
 function Get-Session {
-    param([System.IO.DirectoryInfo]$Dir, [int]$Ttl, [DateTime]$NowUtc)
+    param([System.IO.DirectoryInfo]$Dir, [int]$Ttl, [DateTime]$NowUtc, [bool]$LiveCtn = $false, [string]$CtnStatus = '')
     $id = $Dir.Name
     $num = $null
     if ($id -match '^issue-(\d+)$') { $num = [int]$Matches[1] }
@@ -336,7 +341,7 @@ function Get-Session {
 
     $updatedAt = [string](Get-Prop $state 'updated_at')
     $ageSec = Get-RelAge -UpdatedAt $updatedAt -NowUtc $NowUtc
-    $verdict = Get-Verdict -State $state -Result $result -AgeSec $ageSec -Ttl $Ttl
+    $verdict = Get-Verdict -State $state -Result $result -AgeSec $ageSec -Ttl $Ttl -LiveCtn $LiveCtn
 
     $confidence = Get-Prop $state 'confidence'
     if ($null -eq $confidence -and $null -ne $result) { $confidence = Get-Prop $result 'confidence' }
@@ -363,6 +368,8 @@ function Get-Session {
         status_label  = $verdict.label
         level         = $verdict.level
         stale         = $verdict.stale
+        live_ctn      = $LiveCtn
+        ctn_status    = $CtnStatus
         current_step  = [string](Get-Prop $state 'current_step')
         next_gate     = [string](Get-Prop $state 'next_gate')
         gates         = Get-Gates $state
@@ -399,7 +406,13 @@ function Collect-State {
     if (Test-Path -LiteralPath $wsDir) {
         foreach ($d in (Get-ChildItem -LiteralPath $wsDir -Directory | Sort-Object Name)) {
             if (Test-Path -LiteralPath (Join-Path $d.FullName 'pipeline-state.json')) {
-                $sessions.Add((Get-Session -Dir $d -Ttl $ttl -NowUtc $nowUtc))
+                # A sandbox container named autonomad-sandbox-<workspace> proves the dev
+                # run is live — pass it so the session renders as 'Dev Running', not stale.
+                $liveCtn = $false; $ctnStatus = ''
+                $ctnName = "autonomad-sandbox-$($d.Name)"
+                $match = @($live.sandbox_ctns | Where-Object { $_.name -eq $ctnName })
+                if ($match.Count -gt 0) { $liveCtn = $true; $ctnStatus = [string]$match[0].status }
+                $sessions.Add((Get-Session -Dir $d -Ttl $ttl -NowUtc $nowUtc -LiveCtn $liveCtn -CtnStatus $ctnStatus))
             }
         }
     }
@@ -448,7 +461,6 @@ $script:Template = @'
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<meta http-equiv="refresh" content="__REFRESH__">
 <title>Autonomad Monitor</title>
 <style>
   :root{
@@ -593,6 +605,15 @@ $script:Template = @'
   <div id="log-lines"></div>
 </div>
 
+<div class="section-title">Sandbox Activity <span id="sbox-meta" style="text-transform:none; letter-spacing:0;"></span></div>
+<div class="logs">
+  <div class="log-ctl">
+    <input id="sbox-filter" type="search" placeholder="filter sandbox…" style="width:200px;">
+    <label><input type="checkbox" id="sbox-autoscroll" checked> auto-scroll</label>
+  </div>
+  <div id="sbox-lines"></div>
+</div>
+
 <div class="footer">
   <span>Data: <span id="f-data"></span></span>
   <span>Refresh: <span id="f-refresh"></span>s</span>
@@ -604,6 +625,7 @@ $script:Template = @'
 <script>
 const INITIAL_STATE = __INITIAL_STATE__;
 let state = INITIAL_STATE;
+let logTail = INITIAL_STATE.log_tail || null;   // owned by the log panel poller
 let expanded = new Set();
 let paused = false;
 const LEVELS = { crit:['🔴','Needs Human'], warn:['🟡','Stale'], active:['🔵','Active'], ok:['✅','Done'], muted:['⚪','Unknown'] };
@@ -629,12 +651,64 @@ async function fetchState(){
   return r.json();
 }
 
+async function fetchLogs(){
+  const r = await fetch('/api/logs', {cache:'no-store'});
+  if (!r.ok) throw new Error('HTTP ' + r.status);
+  return r.json();
+}
+
+let sandboxTail = null;
+async function fetchSandbox(){
+  const r = await fetch('/api/sandbox-logs', {cache:'no-store'});
+  if (!r.ok) throw new Error('HTTP ' + r.status);
+  return r.json();
+}
+async function tickSandbox(){
+  if (document.hidden) return;
+  try {
+    sandboxTail = await fetchSandbox();
+    renderSandbox(sandboxTail);
+  } catch(e){ /* keep last good render */ }
+}
+function renderSandbox(st){
+  if (!st) return;
+  const filter = $('#sbox-filter').value.toLowerCase();
+  const lines = (st.lines || []).slice().reverse().filter(l => !filter || String(l).toLowerCase().includes(filter));
+  const auto = $('#sbox-autoscroll').checked;
+  const el = $('#sbox-lines');
+  const ctn = el.parentElement;
+  const html = lines.map(l => {
+    const c = /ERROR/i.test(l) ? 'err' : (/WARN/i.test(l) ? 'warn' : '');
+    return '<div class="log-line ' + c + '">' + esc(l) + '</div>';
+  }).join('') || '<div class="log-line" style="color:var(--muted)">(no sandbox container running)</div>';
+  if (el.innerHTML !== html) {
+    el.innerHTML = html;
+    if (auto) ctn.scrollTop = 0;
+  }
+  $('#sbox-meta').textContent = st.container ? ('ctn ' + st.container) : 'idle';
+}
+
+// Per-panel DOM diff: only rewrite a panel when its content actually changed,
+// so panels refresh in place instead of the whole page re-rendering.
+function setHtml(sel, html){
+  const el = $(sel);
+  if (el && el.innerHTML !== html) el.innerHTML = html;
+}
+
 async function tick(){
   if (paused) return;
   if (document.hidden) return;               // pause when tab hidden (Page Visibility)
   try {
     state = await fetchState();
     render();
+  } catch(e){ /* keep last good render */ }
+}
+
+async function tickLogs(){
+  if (document.hidden) return;
+  try {
+    logTail = await fetchLogs();
+    renderLogs(logTail);
   } catch(e){ /* keep last good render */ }
 }
 
@@ -657,13 +731,13 @@ function render(){
     ? (sup.alive ? (sup.tick_status === 'running' ? 'supervisor+tick up' : 'supervisor up') : 'SUPERVISOR DOWN ⚠')
     : 'supervisor off';
   const recTxt = sup && sup.last_reconcile_at ? 'reconcile ' + fmtAge(sup.last_reconcile_age_sec) + ' ago' : 'reconcile never';
-  sub.innerHTML =
+  setHtml('#subdots',
     '<span class="dot">⟳ ' + esc(tickTxt) + '</span>' +
     '<span class="dot">🛡 ' + esc(supTxt) + '</span>' +
     '<span class="dot">🔧 ' + esc(recTxt) + '</span>' +
     '<span class="dot">🐳 sandbox: ' + (lv.sandbox_ctns.length ? lv.sandbox_ctns.length + ' ctn' : 'none') + '</span>' +
     '<span class="dot">📦 image: ' + (lv.image_present ? 'present' : 'missing') + '</span>' +
-    '<span class="dot">⏱ last tick: ' + (lv.last_tick ? fmtAge(lv.last_tick_age) + ' ago' + (staleTick ? ' ⚠' : '') : 'never') + '</span>';
+    '<span class="dot">⏱ last tick: ' + (lv.last_tick ? fmtAge(lv.last_tick_age) + ' ago' + (staleTick ? ' ⚠' : '') : 'never') + '</span>');
   $('#last-refresh').textContent = 'updated ' + new Date().toLocaleTimeString();
   $('#btn-pause').textContent = paused ? '▶' : '⏸';
 
@@ -672,7 +746,7 @@ function render(){
   const cnt = l => S.filter(s => s.level === l).length;
   const tiles = $('#tiles');
   const t = (k,v,cls,extra) => '<div class="tile ' + cls + '"><div class="k">' + k + '</div><div class="v">' + v + (extra||'') + '</div></div>';
-  tiles.innerHTML =
+  setHtml('#tiles',
     t('Overall', ov.icon + ' ' + ov.status, ov.level) +
     t('Active', cnt('active'), cnt('active') ? 'active':'muted') +
     t('Stale', cnt('warn'), cnt('warn') ? 'warn':'muted') +
@@ -680,7 +754,7 @@ function render(){
     t('Done', cnt('ok'), cnt('ok') ? 'ok':'muted') +
     t('Last tick', lv.last_tick ? fmtAge(lv.last_tick_age) + ' ago' : 'never', staleTick ? 'warn':'muted', '<small> ttl ' + state.ttl + 's</small>') +
     t('Sandbox', lv.sandbox_ctns.length ? lv.sandbox_ctns.length + ' ctn' : 'none', lv.sandbox_ctns.length ? 'active':'muted') +
-    t('Workspaces', S.length, 'muted');
+    t('Workspaces', S.length, 'muted'));
 
   // cards
   const statusFilter = $('#status-filter').value;
@@ -688,20 +762,11 @@ function render(){
   const sorted = S.slice().sort((a,b) => severityOrder(a) - severityOrder(b) || (b.age_sec ?? 0) - (a.age_sec ?? 0));
   const shown = sorted.filter(s => (statusFilter === 'all' || s.level === statusFilter) &&
     (!q || String(s.issue_number || '').includes(q) || String(s.title||'').toLowerCase().includes(q)));
-  $('#cards').innerHTML = shown.length ? shown.map(cardHtml).join('') :
-    '<div class="empty">' + (S.length ? 'No sessions match the current filters.' : 'No workspaces found yet — Autonomad has not claimed any issues.' ) + '</div>';
+  setHtml('#cards', shown.length ? shown.map(cardHtml).join('') :
+    '<div class="empty">' + (S.length ? 'No sessions match the current filters.' : 'No workspaces found yet — Autonomad has not claimed any issues.' ) + '</div>');
 
-  // logs
-  const filter = $('#log-filter').value.toLowerCase();
-  const lines = (state.log_tail.lines || []).filter(l => !filter || String(l).toLowerCase().includes(filter));
-  const auto = $('#log-autoscroll').checked;
-  const logEl = $('#log-lines');
-  logEl.innerHTML = lines.map(l => {
-    const c = /ERROR/i.test(l) ? 'err' : (/WARN/i.test(l) ? 'warn' : '');
-    return '<div class="log-line ' + c + '">' + esc(l) + '</div>';
-  }).join('') || '<div class="log-line" style="color:var(--muted)">(empty log)</div>';
-  if (auto) logEl.parentElement.scrollTop = logEl.parentElement.scrollHeight;
-  $('#logfile').textContent = state.log_tail.file || '';
+  // logs — now its own per-panel poller (tickLogs → renderLogs), so the Live
+  // Logs panel refreshes independently of the rest of the page.
 
   // footer
   $('#f-data').textContent = state.data_dir;
@@ -715,12 +780,34 @@ function render(){
   renderQueue();
 }
 
+function renderLogs(lt){
+  if (!lt) return;
+  const filter = $('#log-filter').value.toLowerCase();
+  // DESCENDING: newest log line first.
+  const lines = (lt.lines || []).slice().reverse().filter(l => !filter || String(l).toLowerCase().includes(filter));
+  const auto = $('#log-autoscroll').checked;
+  const logEl = $('#log-lines');
+  const ctn = logEl.parentElement;
+  const pinnedTop = ctn.scrollTop <= 4;   // user is at the newest line
+  const html = lines.map(l => {
+    const c = /ERROR/i.test(l) ? 'err' : (/WARN/i.test(l) ? 'warn' : '');
+    return '<div class="log-line ' + c + '">' + esc(l) + '</div>';
+  }).join('') || '<div class="log-line" style="color:var(--muted)">(empty log)</div>';
+  if (logEl.innerHTML !== html) {
+    logEl.innerHTML = html;
+    // Newest is at the top — auto-scroll pins to top.
+    if (auto) ctn.scrollTop = 0;
+  } else if (auto && pinnedTop) {
+    ctn.scrollTop = 0;
+  }
+  $('#logfile').textContent = lt.file || '';
+}
+
 function renderHealth(){
-  const panel = $('#health-panel');
   const sup = state.supervisor;
   if (!sup) {
-    panel.innerHTML = '<div class="empty">Supervisor not started — invoke <b>/autonomad</b> to auto-start it, or run ' +
-      '<code>pwsh -NoProfile -WindowStyle Hidden -File C:\GitRepos\autonomad\src\supervisor.ps1</code>.</div>';
+    setHtml('#health-panel', '<div class="empty">Supervisor not started — invoke <b>/autonomad</b> to auto-start it, or run ' +
+      '<code>pwsh -NoProfile -WindowStyle Hidden -File C:\GitRepos\autonomad\src\supervisor.ps1</code>.</div>');
     $('#heal-count').textContent = '';
     $('#queue-meta').textContent = '';
     return;
@@ -730,50 +817,49 @@ function renderHealth(){
   const dockerOk = !!sup.docker_up;
   const tickOk = sup.tick_status === 'running' || (sup.tick_pid && sup.alive);
   const ghOk = !!sup.gh_auth;
-  panel.innerHTML =
+  let html =
     t('Supervisor', supUp ? 'up' : 'DOWN', supUp ? 'ok' : 'crit', '<small> pid ' + esc(sup.pid ?? '—') + '</small>') +
     t('Tick loop', tickOk ? 'running' : (sup.tick_status || 'stopped'), tickOk ? 'ok' : 'warn', sup.tick_pid ? '<small> pid ' + esc(sup.tick_pid) + '</small>' : '') +
     t('Docker', dockerOk ? 'up' : 'down', dockerOk ? 'ok' : 'crit') +
     t('gh auth', ghOk ? 'ok' : 'fail', ghOk ? 'ok' : 'crit') +
     t('Last reconcile', sup.last_reconcile_at ? fmtAge(sup.last_reconcile_age_sec) + ' ago' : 'never', sup.last_reconcile_at ? 'active' : 'muted') +
     t('Heal events', state.heal_events.length, state.heal_events.length ? 'active' : 'muted');
-  if (sup.last_error) panel.innerHTML += '<div class="halt" style="margin-top:8px;">⚠ ' + esc(sup.last_error) + '</div>';
-  if (sup.last_reconcile_result) panel.innerHTML += '<div class="chips" style="margin-top:8px;"><span class="chip">' + esc(sup.last_reconcile_result) + '</span></div>';
+  if (sup.last_error) html += '<div class="halt" style="margin-top:8px;">⚠ ' + esc(sup.last_error) + '</div>';
+  if (sup.last_reconcile_result) html += '<div class="chips" style="margin-top:8px;"><span class="chip">' + esc(sup.last_reconcile_result) + '</span></div>';
+  setHtml('#health-panel', html);
 }
 
 function renderHeal(){
-  const panel = $('#heal-panel');
   const ev = state.heal_events || [];
   $('#heal-count').textContent = ev.length ? '(' + ev.length + ' recent)' : '';
   if (!ev.length) {
-    panel.innerHTML = '<div class="empty">No reconciliation events yet — the gated self-heal has not needed to act.</div>';
+    setHtml('#heal-panel', '<div class="empty">No reconciliation events yet — the gated self-heal has not needed to act.</div>');
     return;
   }
   const clsOf = a => ({resume:'pass', 'mark-pending-review':'pass', release:'info', 'close-out':'info', 'resolve-halt':'pass', warn:'fail'})[a] || 'other';
-  panel.innerHTML = '<div class="card"><ul class="tl" style="padding:8px 14px;">' + ev.map(e =>
+  setHtml('#heal-panel', '<div class="card"><ul class="tl" style="padding:8px 14px;">' + ev.map(e =>
     '<li><span class="t-dot ' + clsOf(e.action) + '"></span>' +
     '<span class="t-main"><span class="t-gate">' + esc(e.action) + (e.dry_run ? ' (dry-run)' : '') + '</span> ' +
     '<span class="t-agent">' + esc(e.issue) + '</span>' +
     '<div class="t-note">' + esc(e.reason || '') + '</div></span>' +
     '<span class="t-ts">' + fmtTs(e.ts) + '</span></li>'
-  ).join('') + '</ul></div>';
+  ).join('') + '</ul></div>');
 }
 
 function renderQueue(){
-  const panel = $('#queue-panel');
   const q = state.queue;
   $('#queue-meta').textContent = q ? '(' + q.length + ' claimable)' : (state.queue_error ? '(' + esc(state.queue_error) + ')' : '');
   if (!q || !q.length) {
-    panel.innerHTML = '<div class="empty">' +
+    setHtml('#queue-panel', '<div class="empty">' +
       (q ? 'No claimable issues (no unassigned ready-for-agent / autonomous tickets).' :
         (state.queue_error ? 'Claim queue unavailable: ' + esc(state.queue_error) :
-          'No supervisor state — queue repo unknown.')) + '</div>';
+          'No supervisor state — queue repo unknown.')) + '</div>');
     return;
   }
-  panel.innerHTML = '<div class="card"><ul class="tl" style="padding:8px 14px;">' + q.map(i =>
+  setHtml('#queue-panel', '<div class="card"><ul class="tl" style="padding:8px 14px;">' + q.map(i =>
     '<li><span class="t-dot info"></span>' +
     '<span class="t-main"><span class="t-gate">#' + i.number + '</span> <span class="t-note" style="display:inline">' + esc(i.title) + '</span></span></li>'
-  ).join('') + '</ul></div>';
+  ).join('') + '</ul></div>');
 }
 
 function gateSegs(gates){
@@ -793,13 +879,14 @@ function cardHtml(s){
   if (s.harness) chips.push(esc(s.harness));
   if (s.current_step) chips.push('step ' + esc(s.current_step) + (s.next_gate ? ' → ' + esc(s.next_gate) : ''));
   chips.push('updated ' + fmtAge(s.age_sec) + ' ago');
+  if (s.live_ctn) chips.push('🖥 sandbox dev' + (s.ctn_status ? ' (' + esc(s.ctn_status) + ')' : ''));
   const staleChip = s.stale ? '<span class="chip stale">⚠ stale (&gt; ttl)</span>' : '';
   const halt = s.halt_reason ? '<div class="halt">⛔ ' + esc(s.halt_reason) + '</div>' : '';
   const res = s.result ? '<div class="result-box"><b>' + esc(s.result.outcome) + '</b>' +
     (s.result.confidence !== null && s.result.confidence !== undefined ? ' · ' + Math.round(s.result.confidence*100) + '% confidence' : '') +
     (s.result.summary ? ' · ' + esc(s.result.summary) : '') + '</div>' : '';
   const perr = s.parse_error ? '<div class="err-box">unreadable pipeline-state: ' + esc(s.parse_error) + '</div>' : '';
-  const acts = s.agent_logs && s.agent_logs.length ? s.agent_logs.map(l =>
+  const acts = s.agent_logs && s.agent_logs.length ? s.agent_logs.filter(Boolean).map(l =>
     '<li><span class="t-dot ' + (/^pass/i.test(l.status||'') ? 'pass' : (/^fail/i.test(l.status||'') ? 'fail' : (l.status ? 'info':'other'))) + '"></span>' +
     '<span class="t-main"><span class="t-gate">' + esc(l.gate || '') + '</span>' +
     (l.agent ? ' <span class="t-agent">' + esc(l.agent) + '</span>' : '') +
@@ -838,14 +925,20 @@ $('#btn-pause').onclick = () => { paused = !paused; $('#btn-pause').textContent 
 $('#btn-refresh').onclick = async () => { try { state = await fetchState(); render(); } catch(e){} };
 $('#status-filter').onchange = render;
 $('#search').oninput = render;
-$('#log-filter').oninput = render;
-$('#log-autoscroll').onchange = render;
+$('#log-filter').oninput = () => renderLogs(logTail);
+$('#log-autoscroll').onchange = () => renderLogs(logTail);
+$('#sbox-filter').oninput = () => renderSandbox(sandboxTail);
+$('#sbox-autoscroll').onchange = () => renderSandbox(sandboxTail);
 document.addEventListener('visibilitychange', () => { if (!document.hidden) tick(); });
 
 // initial paint + polling
 render();
+renderLogs(logTail);
+tickSandbox();
 if (location.protocol !== 'file:') {
-  setInterval(tick, Math.max(2, state.refresh || 5) * 1000);
+  setInterval(tick, Math.max(2, state.refresh || 5) * 1000);          // state panels
+  setInterval(tickLogs, Math.max(1, Math.round((state.refresh || 5) / 2)) * 1000);  // log panel
+  setInterval(tickSandbox, Math.max(2, state.refresh || 5) * 1000);   // sandbox activity panel
 }
 </script>
 </body>
@@ -941,6 +1034,26 @@ while (-not $script:StopRequested) {
         if ($path -eq '/api/state') {
             $fresh = Collect-State -DataDir $DataDir -Refresh $Refresh -LogLines $LogLines
             $json = $fresh | ConvertTo-Json -Depth 12 -Compress
+            Send-Response -Context $ctx -Body $json -ContentType 'application/json; charset=utf-8'
+        } elseif ($path -eq '/api/logs') {
+            # Lightweight per-panel endpoint: log tail only (no gh calls, no
+            # workspace scan) so the Live Logs panel can refresh independently.
+            $logTail = Get-LogTail -DataDir $DataDir -Lines $LogLines
+            $json = $logTail | ConvertTo-Json -Depth 4 -Compress
+            Send-Response -Context $ctx -Body $json -ContentType 'application/json; charset=utf-8'
+        } elseif ($path -eq '/api/sandbox-logs') {
+            # Live tail of the current sandbox container (docker logs), so the
+            # Sandbox Activity panel streams the dev agent's real-time output
+            # even while the tick itself is quiet (long-running sandbox).
+            $ctn = (& docker ps --filter 'name=autonomad-sandbox-' --format '{{.Names}}' 2>$null | Select-Object -First 1)
+            $lines = @()
+            if ($ctn) {
+                $raw = & docker logs --tail $LogLines $ctn 2>&1
+                $lines = @($raw | ForEach-Object {
+                    $_.ToString() -replace "`e\[[0-9;]*m", '' -replace "`e\[[0-9;]*[A-Za-z]", ''
+                })
+            }
+            $json = @{ container = $ctn; lines = $lines } | ConvertTo-Json -Depth 4 -Compress
             Send-Response -Context $ctx -Body $json -ContentType 'application/json; charset=utf-8'
         } elseif ($path -eq '/' -or $path -eq '/index.html') {
             $fresh = Collect-State -DataDir $DataDir -Refresh $Refresh -LogLines $LogLines
