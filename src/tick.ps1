@@ -620,7 +620,8 @@ function Checkout-IssueBranch {
         $branches = git branch -a 2>&1
         if ($LASTEXITCODE -ne 0) { throw 'git branch -a failed' }
         $branchExists = ($branches | Select-String -SimpleMatch "origin/$Branch") -ne $null -or
-                        ($branches | Select-String -SimpleMatch "  $Branch") -ne $null
+                        ($branches | Select-String -SimpleMatch "  $Branch") -ne $null -or
+                        ($branches | Select-String -SimpleMatch "* $Branch") -ne $null
         if ($branchExists) {
             git checkout "$Branch" 2>&1 | Out-Null
             if ($LASTEXITCODE -ne 0) { throw "git checkout $Branch failed" }
